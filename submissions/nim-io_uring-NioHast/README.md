@@ -94,12 +94,16 @@ Run time (environment for `start.sh`):
 | `EVICT_HIGH` | `63000` | High-water mark that triggers idle keep-alive eviction |
 | `EVICT_LOW` | `56000` | Low-water mark eviction drains down to (hysteresis) |
 | `TCP_DEFER_ACCEPT_SEC` | `1` | Seconds the kernel waits for the first client byte before accepting; `0` disables |
+| `SQLITE_MMAP_SIZE` | `1073741824` | SQLite `mmap_size` in bytes (1 GiB); `0` disables mmap |
+| `EPOLL_PARK_US` | `0` (off) | epoll only: park this many µs before the next wait when a pass carried <32 events, to batch arrivals (trades a little latency for fewer wake-ups) |
+| `TCP_NOTSENT_LOWAT_BYTES` | `0` (off) | Cap the unsent write queue per connection (e.g. `131072`); on io_uring this forces the register-per-accept path |
+| `TCP_QUICKACK` | `0` (off) | `1` sets `TCP_QUICKACK` on accepted sockets; on io_uring this forces the register-per-accept path |
 
 Configuration: `SQLITE_PATH`, `JWT_SECRET`, `HOST`, `PORT` (default `127.0.0.1:3000`).
 
 Everything else is deliberately fixed in code and not tunable at run time: one thread per process,
-persistent prepared statements, WAL + `synchronous=NORMAL`, `mmap`, idle eviction + RST, the 4096
-listen backlog, EMFILE backoff, and the O(n) parser.
+persistent prepared statements, WAL + `synchronous=NORMAL`, idle eviction + RST, the 4096 listen
+backlog, EMFILE backoff, the O(n) parser, and off-path WAL checkpoints.
 
 ## Architecture
 
@@ -133,8 +137,9 @@ connection tiny.
 | File | Responsibility |
 |---|---|
 | `src/server_iouring.nim` | **default** io_uring loop: multishot accept/recv, provided-buffer pool, registered fds, group commit, run-time epoll fallback |
-| `src/server.nim` | **always-built fallback** epoll loop, accept/read/write, keep-alive, timeouts, backpressure, **eviction** |
+| `src/server_epoll.nim` | **always-built fallback** epoll loop, accept/read/write, keep-alive, timeouts, backpressure, **eviction** |
 | `src/http.nim` | shared, transport-agnostic HTTP/1.1 request parsing + response framing (used by both transports) |
+| `src/engine.nim` | shared scaffold used by both transports: `raiseNofile`, listening-socket setup, and the `processRequests` loop |
 | `src/iouring.nim` | self-contained raw io_uring bindings (no liburing) |
 | `src/api.nim` | routing + the five endpoints + exact error semantics (transport-agnostic) |
 | `src/db.nim` | all SQL; prepared statements; pragmas; durability ordering |
@@ -170,12 +175,14 @@ next readiness event so a slow reader can never stall the loop.
 
 **Data path**
 - **One SQLite connection, statements prepared once.** Statements use `SQLITE_PREPARE_PERSISTENT`; SQL
-  never re-parses.
+  never re-parses, and `SQLITE_ENABLE_QPSG` keeps the plan stable if a statement is ever re-prepared.
 - **JSON serialized in Nim**, not by SQLite's `json_object`/`json_group_array`: the response bytes are
   written by a small escaping routine, avoiding extra SQLite-side allocation and function calls.
-- **mmap + a small page cache.** Reads come from the OS page cache; the SQLite cache stays small.
-- **Bounded WAL.** `wal_autocheckpoint=1000` (with `journal_size_limit`) keeps the `-wal` file from
-  growing without bound under sustained writes; checkpoints are passive and cheap.
+- **mmap + a small page cache.** Reads come from the OS page cache (size via `SQLITE_MMAP_SIZE`,
+  default 1 GiB); the SQLite cache stays small.
+- **WAL checkpoint off the hot path.** Autocheckpoint is disabled (`wal_autocheckpoint=0`) and a
+  **PASSIVE** checkpoint runs at most once a second from the idle branch of the loop, so no request
+  pays a checkpoint fsync; `journal_size_limit` still bounds the `-wal` file.
 - **Write group commit** (default on): writes issued during one event-loop pass share a single
   transaction that commits before any dependent response is sent (`synchronous=NORMAL`, the documented
   floor the rules allow).
@@ -245,8 +252,9 @@ the database stays uncorrupted. `synchronous=OFF` (which can corrupt the file) i
 - **Two binaries:** `build.sh` builds `bin/server_iouring` (the default transport) and `bin/server`
   (the epoll fallback). The io_uring build is best-effort: on any failure the script warns, drops the
   half-written binary, and still exits 0 with the epoll-only server. `IO_URING=0` skips it.
-- **SQLite:** the `3.54.0` amalgamation is downloaded by `build.sh` (sha256-verified) and compiled
-  in-tree, so the submission has **no system `libsqlite3` dependency** and builds cleanly from source.
+- **SQLite:** the `3.54.0` amalgamation is downloaded by `build.sh` (sha256-verified, `curl --retry 3`)
+  and compiled in-tree, so the submission has **no system `libsqlite3` dependency** and builds cleanly
+  from source.
 - **nimcrypto:** `src/jwt.nim` needs it for HMAC-SHA256. It is vendored the same way (pinned `0.7.3`
   tarball, sha256-verified, extracted into `vendor/nimcrypto`) and `config.nims` adds its path to every
   compile, so the build never depends on anything installed in a user Nimble directory.
@@ -258,11 +266,12 @@ the database stays uncorrupted. `synchronous=OFF` (which can corrupt the file) i
   `-DSQLITE_DEFAULT_MEMSTATUS=0`, `-DSQLITE_USE_ALLOCA=1`, `-DSQLITE_LIKE_DOESNT_MATCH_BLOBS`,
   `-DSQLITE_OMIT_DECLTYPE`, `-DSQLITE_OMIT_AUTOINIT` (with one `sqlite3_initialize()` in `openDb`),
   `-DSQLITE_OMIT_DEPRECATED`, `-DSQLITE_OMIT_LOAD_EXTENSION`, `-DSQLITE_OMIT_PROGRESS_CALLBACK`,
-  `-DSQLITE_OMIT_SHARED_CACHE`, `-DSQLITE_MAX_EXPR_DEPTH=0`, `-DSQLITE_TEMP_STORE=3`, `-DSQLITE_ENABLE_JSON1`.
+  `-DSQLITE_OMIT_SHARED_CACHE`, `-DSQLITE_MAX_EXPR_DEPTH=0`, `-DSQLITE_TEMP_STORE=3`, `-DSQLITE_ENABLE_JSON1`,
+  `-DSQLITE_ENABLE_QPSG`.
 
 ## Testing
 
-- `bash test/run.sh submissions/nim-epoll-NioHast`: the official 42-check suite, byte-exact; with no
+- `bash test/run.sh submissions/nim-io_uring-NioHast`: the official 42-check suite, byte-exact; with no
   environment set it runs the default io_uring transport.
 - `TRANSPORT=epoll bash test/run.sh …`: the epoll fallback (also 42/42).
 - Unit tests under `tests/`: `test_db.nim` (queries vs the seed DB and the `sqlite3` CLI),
@@ -292,10 +301,10 @@ No `mummy` code is used, imported, or shipped.
 ## Repository layout
 
 ```
-submissions/nim-epoll-NioHast/
+submissions/nim-io_uring-NioHast/
   install.sh  build.sh  start.sh  README.md  .gitignore  config.nims
   docs/   ARCHITECTURE.md  DEVELOPMENT.md  PERFORMANCE.md  DEPENDENCIES.md
-  src/    server_iouring.nim server.nim iouring.nim http.nim
+  src/    server_iouring.nim server_epoll.nim engine.nim iouring.nim http.nim
           api.nim db.nim sqlite3.nim jwt.nim jsonbuf.nim model.nim config.nim
   tests/  test_db.nim test_jwt.nim test_iouring.nim
   vendor/ (downloaded by build.sh; gitignored)   bin/ nimcache/ (gitignored)

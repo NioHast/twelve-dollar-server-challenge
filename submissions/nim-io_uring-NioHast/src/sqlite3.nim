@@ -37,9 +37,13 @@
 ##                                  sqlite3_initialize() exactly once before any
 ##                                  SQLite API call; openDb() does this (and it is
 ##                                  the only SQLite entry point in the program).
+##   * SQLITE_ENABLE_QPSG         - Query Planner Stability Guarantee: a
+##                                  parameterized statement keeps a stable plan
+##                                  across re-preparation, so the hot read path
+##                                  never re-plans. (added)
 ## The original flags are all preserved verbatim.
 {.compile("../vendor/sqlite3.c",
-  "-O3 -DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DQS=0 -DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_ENABLE_JSON1 -DSQLITE_USE_ALLOCA=1 -DSQLITE_OMIT_DECLTYPE -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_AUTOINIT").}
+  "-O3 -DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DQS=0 -DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_QPSG -DSQLITE_USE_ALLOCA=1 -DSQLITE_OMIT_DECLTYPE -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_AUTOINIT").}
 
 type
   Sqlite3* {.incompleteStruct.} = object
@@ -64,6 +68,9 @@ const
 
   ## `SQLITE_TRANSIENT` tells sqlite to make its own copy of bound text.
   SQLITE_TRANSIENT* = cast[Sqlite3Destructor](-1)
+
+  ## `sqlite3_wal_checkpoint_v2` mode: PASSIVE never blocks on readers.
+  SQLITE_CHECKPOINT_PASSIVE* = 0
 
 ## Required exactly once before any other SQLite call when the amalgamation is
 ## built with SQLITE_OMIT_AUTOINIT (see the compile flags above). openDb() calls
@@ -126,4 +133,8 @@ proc sqlite3_errcode*(db: ptr Sqlite3): cint
 proc sqlite3_exec*(db: ptr Sqlite3, sql: cstring,
                    callback: Sqlite3ExecCallback, arg: pointer,
                    errmsg: ptr cstring): cint
+  {.importc, header: "vendor/sqlite3.h".}
+
+proc sqlite3_wal_checkpoint_v2*(db: ptr Sqlite3, zDb: cstring, eMode: cint,
+                                pnLog: ptr cint, pnCkpt: ptr cint): cint
   {.importc, header: "vendor/sqlite3.h".}

@@ -38,7 +38,7 @@ shipped, it was a scaffold, later replaced by the hand-written loop.
 
 ## 2. Replace the bootstrap with a raw epoll server
 
-The default transport (`src/server.nim`) is written from scratch:
+The default transport (`src/server_epoll.nim`) is written from scratch:
 
 - single thread, edge-triggered epoll,
 - non-blocking `accept4` / `recv` / `send`,
@@ -105,7 +105,7 @@ kind of bug that must never reach a benchmark. Fixes:
 - strict `Content-Length` / reject `Transfer-Encoding`,
 - bound buffered input; process all buffered requests per event with no
   stall-prone resume state,
-- bound the WAL (`wal_autocheckpoint=1000`),
+- bound the WAL (a ~1/s PASSIVE checkpoint off the request path),
 - release oversized buffers on close,
 - replace an O(n²) front-delete parser with an O(n) cursor.
 
@@ -131,3 +131,34 @@ server alive, and the adversarial tests still pass.
 - The hard walls are the fd limit and conntrack, not CPU, design for them.
 - Hunt for the one-request-kills-the-server bug **before** the benchmark, not
   during it.
+
+## 8. Post-submission consolidation and tuning
+
+After the submission was sent, the code was reviewed for readability and then
+given a set of opt-in performance passes, all still gated on `test/run.sh` = 42/42
+on both transports:
+
+- **Consolidation (no behaviour change).** Dead fields/constants were removed, the
+  shared transport constants were given one home, and the connection resets went
+  from field-by-field writes to a single `Conn(...)` constructor. The socket
+  setup, the process fd-limit bump and the `processRequests` loop - previously
+  copy-pasted in both transports - moved into a new `src/engine.nim`, so each
+  transport keeps only a thin adapter.
+- **WAL checkpoint off the hot path.** `wal_autocheckpoint=0` plus a PASSIVE
+  checkpoint at most once a second, so no request pays a checkpoint fsync.
+- **`SQLITE_ENABLE_QPSG`** so a parameterized statement keeps a stable plan across
+  re-preparation.
+- **`SQLITE_MMAP_SIZE`** exposes the SQLite mmap size (default 1 GiB).
+- **`curl --retry 3`** in `build.sh`, so a transient network blip cannot fail a
+  clean build.
+- **Opt-in TCP knobs** (default off): `TCP_NOTSENT_LOWAT_BYTES`, `TCP_QUICKACK`
+  (both fall back to register-per-accept on io_uring, since a directly-accepted
+  socket has no userspace fd), and `EPOLL_PARK_US` adaptive batching on epoll.
+
+Candidates that were evaluated and **not** adopted, with reasons: a separate
+read/write SQLite connection (complexity vs. a single-writer workload),
+`MADV_HUGEPAGE` on the SQLite mmap (the mmap is SQLite-managed; forcing THP needs
+kernel settings, which rule 11 forbids), a startup page-cache prefetch (the
+scoring run warms up first, so it is neutral), and a `timerfd` sweep (the existing
+1 s `epoll_wait` timeout already wakes only when idle - no extra wake-ups to
+remove).

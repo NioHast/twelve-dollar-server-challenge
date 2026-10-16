@@ -1,7 +1,7 @@
 ## http.nim: transport-agnostic HTTP/1.1 parsing and response framing.
 ##
 ## Both transports share this module verbatim - the default io_uring loop in
-## `server_iouring.nim` and the epoll fallback in `server.nim` - so the request
+## `server_iouring.nim` and the epoll fallback in `server_epoll.nim` - so the request
 ## parser and the response bytes can never drift apart. Nothing here touches a
 ## socket, an event loop or the database: every routine is pure string-in /
 ## string-out, and the only policy knob it needs (the inbound body cap, which
@@ -31,6 +31,12 @@ const
   ## treated as malformed. Shared by both transports so a hostile header block
   ## is bounded identically on either path.
   MaxHeader* = 16 * 1024
+
+  ## Server-loop policy shared verbatim by both transports (identical today;
+  ## kept here so the two copies can never silently drift).
+  ListenBacklog* = 4096
+  IdleKeepAlive* = 75.0
+  StallTimeout* = 30.0
 
 type
   HeadInfo* = object

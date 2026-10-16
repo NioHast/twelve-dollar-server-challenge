@@ -23,6 +23,8 @@
 ## rollback, and the server turns every response produced against that batch into
 ## a 500 -- it can never answer success for a write that did not commit.
 
+import std/[os, strutils]
+
 import ./sqlite3
 import ./model
 
@@ -45,6 +47,7 @@ type
     stmtHealth: ptr Sqlite3Stmt
     groupCommit: bool
     batchState: BatchState
+    dirty: bool          ## a write happened since the last checkpoint
 
   LikeOutcome* = enum
     loLiked, loAlready, loNoPost
@@ -106,13 +109,18 @@ proc applyPragmas(db: Db) =
   db.execPragma("foreign_keys=ON", tolerate = false)
   db.execPragma("temp_store=MEMORY", tolerate = false)
   db.execPragma("cache_size=-8000", tolerate = false)
-  db.execPragma("mmap_size=1073741824", tolerate = false)
-  # Checkpoint the WAL every ~1000 pages (SQLite's default) instead of never.
-  # The previous value (0) disabled autocheckpoint entirely and nothing else
-  # called sqlite3_wal_checkpoint, so under sustained writes the -wal file grew
-  # without bound (each write appends a frame). 1000 pages keeps it bounded;
-  # journal_size_limit below then truncates the WAL at checkpoint.
-  db.execPragma("wal_autocheckpoint=1000", tolerate = false)
+  # mmap size is env-tunable (SQLITE_MMAP_SIZE, bytes; default 1 GiB).
+  var mmapBytes = 1073741824
+  try:
+    mmapBytes = parseInt(getEnv("SQLITE_MMAP_SIZE", "1073741824"))
+  except ValueError:
+    mmapBytes = 1073741824
+  db.execPragma("mmap_size=" & $mmapBytes, tolerate = false)
+  # WAL autocheckpoint is DISABLED (0): the WAL is checkpointed explicitly, off
+  # the write path, by checkpointPassive() once per event-loop pass (~1/s). That
+  # keeps a checkpoint fsync out of any single request's latency while
+  # journal_size_limit still bounds the WAL file.
+  db.execPragma("wal_autocheckpoint=0", tolerate = false)
   db.execPragma("journal_size_limit=67108864", tolerate = false)
   db.execPragma("locking_mode=EXCLUSIVE", tolerate = false)
 
@@ -215,6 +223,17 @@ proc commitBatch*(db: Db): bool =
       discard sqlite3_exec(db.handle, "ROLLBACK".cstring, nil, nil, nil)
       db.batchState = bsNone
       result = false
+
+proc checkpointPassive*(db: Db) =
+  ## Run a PASSIVE WAL checkpoint, off the request path. Called at most ~1/s from
+  ## the event loop after a write. No-op while a group-commit batch is open or
+  ## when nothing has been written since the last checkpoint. PASSIVE never
+  ## blocks on readers, so it cannot stall the single-threaded loop.
+  if db.handle == nil or not db.dirty or db.batchOpen():
+    return
+  db.dirty = false
+  discard sqlite3_wal_checkpoint_v2(db.handle, nil, SQLITE_CHECKPOINT_PASSIVE,
+                                    nil, nil)
 
 # ---------------------------------------------------------------------------
 # public API
@@ -334,6 +353,7 @@ proc createPost*(db: Db, userId: int64, username, body: string,
   post.createdAt = createdAt
   post.author = username
   post.likeCount = 0
+  db.dirty = true
   result = true
 
 proc like*(db: Db, userId, postId: int64): LikeOutcome =
@@ -360,6 +380,7 @@ proc like*(db: Db, userId, postId: int64): LikeOutcome =
     db.fail("like insert")
 
   if sqlite3_changes(db.handle) == 1:
+    db.dirty = true
     return loLiked
 
   let ex = db.stmtExistsPost

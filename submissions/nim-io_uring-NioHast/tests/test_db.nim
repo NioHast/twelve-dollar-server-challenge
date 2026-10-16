@@ -24,7 +24,7 @@ proc expect(name: string, cond: bool, detail: string) =
 proc runTests() =
   # locate the seed DB relative to this source file, copy it to a temp file.
   let testDir = currentSourcePath().parentDir               # .../tests
-  let submissionDir = testDir.parentDir                     # .../nim-epoll-NioHast
+  let submissionDir = testDir.parentDir                     # .../nim-io_uring-NioHast
   let defaultSeed = submissionDir.parentDir.parentDir / "seed" / "feed.db"
   let seedDb = getEnv("SEED_DB", defaultSeed)
 

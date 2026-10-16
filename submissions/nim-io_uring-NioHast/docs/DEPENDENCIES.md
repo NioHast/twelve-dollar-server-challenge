@@ -51,8 +51,8 @@ to the search path.
 
 ## C headers referenced
 
-`<sys/socket.h>`, `<errno.h>`, `<unistd.h>`, `<sys/syscall.h>`, `<sys/mman.h>`,
-`<linux/io_uring.h>` and the vendored `<sqlite3.h>`: all from glibc /
+`<sys/socket.h>`, `<netinet/tcp.h>`, `<errno.h>`, `<unistd.h>`, `<sys/syscall.h>`,
+`<sys/mman.h>`, `<linux/io_uring.h>` and the vendored `<sqlite3.h>`: all from glibc /
 `linux-libc-dev` (part of `build-essential`) and the vendored SQLite. No extra
 packages.
 

@@ -2,8 +2,8 @@
 ##
 ## Reuses the frozen `api.nim`/`db.nim`/`config.nim` modules unchanged, the raw
 ## io_uring bindings in `iouring.nim`, and the shared HTTP parser/framing in
-## `http.nim`; it does NOT import `server.nim` (that file is a program, not a
-## module). The epoll transport `src/server.nim` is the always-built fallback:
+## `http.nim`; it does NOT import `server_epoll.nim` (that file is a program, not a
+## module). The epoll transport `src/server_epoll.nim` is the always-built fallback:
 ## `start.sh` prefers this binary and drops back to `bin/server`, and this binary
 ## itself execs `bin/server` when `io_uring_setup` fails at run time.
 ##
@@ -45,7 +45,7 @@
 
 import std/[posix, os, strutils, times, nativesockets]
 
-import iouring, config, db, api, http
+import iouring, config, db, api, engine, http
 
 # ---------------------------------------------------------------------------
 # syscall surface std/posix and iouring.nim do not expose for us
@@ -77,9 +77,6 @@ const
   IORING_REGISTER_FILES_UPDATE* = 6
   IORING_ASYNC_CANCEL_USERDATA  = 1'u32 shl 4
 
-  # completion flags
-  IORING_CQE_F_MORE*       = 1'u32 shl 1
-
   # user_data operation tags (low 8 bits) + slot (next 24) + generation (high 32)
   TAG_ACCEPT*  = 1'u64
   TAG_RECV*    = 2'u64
@@ -97,16 +94,13 @@ const
   FixedSlots   = 32768
   ListenSlot   = 0'i32
 
-  # read/parse limits (identical policy to server.nim)
+  # read/parse limits (identical policy to server_epoll.nim)
   MaxInBuf      = 1024 * 1024
   MaxRequest    = MaxInBuf + MaxHeader + 4
-  # Output cap (mirror server.nim): processing stops once this many response
+  # Output cap (mirror server_epoll.nim): processing stops once this many response
   # bytes are buffered, which leaves output in flight so the drain path resumes
   # the remaining pipelined requests.
   MaxOutBuf     = 2 * 1024 * 1024
-  ListenBacklog = 4096
-  IdleKeepAlive = 75.0
-  StallTimeout  = 30.0
   TickSeconds   = 1.0
 
   # -------------------------------------------------------------------------
@@ -142,7 +136,6 @@ type KernelTimespec {.bycopy.} = object
 type
   Conn = object
     active:     bool
-    slot:       cint
     gen:        uint32   ## bumped per reuse so stale CQEs are ignored
     inbuf:      string
     outbuf:     string
@@ -169,10 +162,10 @@ var
   gFreeTop:     int
   gGen:         uint32
   gNow:         float
+  gLastCkpt:    float
   gAcceptArmed: bool
   gAcceptPaused: bool
   gTimeoutArmed: bool
-  gListenRawFd: cint = -1
   openCount:    int
 
   # ---- turbo toggles (env) -------------------------------------------------
@@ -229,68 +222,12 @@ proc udGen(ud: uint64): uint32 {.inline.} = uint32(ud shr 32)
 # above); this transport only supplies its inbound body cap (MaxInBuf) to
 # parseHead.
 
-proc processRequests(c: var Conn): bool =
-  ## Parse and answer complete pipelined requests, OUTPUT-bounded by MaxOutBuf
-  ## (mirrors server.nim). Returns false when the framing is malformed and the
-  ## connection must close. Stopping on the output cap leaves bytes in flight,
-  ## so the send-drain path re-invokes this and finishes the burst.
-  # Advance with a local offset and compact once at the end; front-deleting per
-  # request was O(n^2) on a large pipelined buffer (see server.nim).
-  var pos = 0
-  while true:
-    if c.outbuf.len - c.outOff >= MaxOutBuf:
-      break
-    let hend = c.inbuf.find("\r\n\r\n", pos)
-    if hend < 0:
-      if c.inbuf.len - pos > MaxHeader:
-        return false
-      break
-    if hend - pos > MaxHeader:
-      return false
-
-    let head = parseHead(c.inbuf, pos, hend, MaxInBuf)
-    if not head.ok:
-      return false
-    if head.bad:
-      c.outbuf.add buildResponse(400, """{"error":"bad request"}""", false)
-      c.closing = true
-      return false
-    if head.contentLen > MaxInBuf:
-      return false
-
-    let totalLen = (hend - pos) + 4 + head.contentLen
-    if c.inbuf.len - pos < totalLen:
-      break                  # body not fully arrived
-    var rawBody = ""
-    if head.contentLen > 0:
-      let b = hend + 4
-      rawBody = c.inbuf[b ..< b + head.contentLen]
-    pos += totalLen
-
-    var resp: ApiResponse
-    try:
-      resp = handleRequest(gDb, gSecret, head.httpMethod, head.path, head.auth, rawBody)
-    except Exception as ex:
-      # Exception also covers Defect: a request must never abort the process.
-      stderr.writeLine("request handler error: " & ex.msg)
-      resp = ApiResponse(status: 500, body: """{"error":"internal server error"}""")
-
-    c.keepAlive = head.keepAlive
-    let respStart = c.outbuf.len
-    c.outbuf.add buildResponse(resp.status, resp.body, head.keepAlive)
-    # Record responses produced while a group-commit batch is open: their SEND
-    # must be withheld until that batch commits and becomes 500 if it fails.
-    if gDb != nil and gDb.batchOpen():
-      if c.batchCount == 0:
-        c.batchFrom = respStart
-      inc c.batchCount
-    if not head.keepAlive:
-      c.closing = true
-      break
-
-  if pos > 0:
-    c.inbuf.delete(0 ..< pos)
-  true
+proc processRequests(c: var Conn): bool {.inline.} =
+  ## Thin adapter over the shared engine loop (`engine.nim`); maxOutBuf caps the
+  ## buffered response bytes so a large pipelined burst drains across sends.
+  engine.processRequests(c.inbuf, c.outbuf, c.keepAlive, c.closing, c.outOff,
+                         c.batchFrom, c.batchCount, gDb, gSecret, MaxInBuf,
+                         MaxOutBuf)
 
 # ---------------------------------------------------------------------------
 # fixed-file table bookkeeping
@@ -556,20 +493,19 @@ proc closeConn(slot: cint) =
     return
   c.active = false
   c.closing = true
+  let gen = c.gen
   if c.recvArmed:
-    cancelOp(slot, TAG_RECV, c.gen)
+    cancelOp(slot, TAG_RECV, gen)
   if c.sendArmed:
-    cancelOp(slot, TAG_SEND, c.gen)
+    cancelOp(slot, TAG_SEND, gen)
   # Drop the table's reference; the socket closes once in-flight ops finish.
   discard updateSlotRaw(slot, -1'i32)
-  # Release (not just truncate) so a pooled slot keeps no large capacity.
-  c.inbuf = ""
-  c.outbuf = ""
-  c.outOff = 0
-  c.batchFrom = 0
-  c.batchCount = 0
-  c.deferred = false
-  c.wantFree = true
+  # Reset the slot (releasing the buffers via ARC) but KEEP `gen` and `pending`:
+  # the ops cancelled above still complete and must (a) look current so they
+  # decrement `pending`, and (b) keep the slot off the free list until they do.
+  # wantFree arms that release once `pending` hits zero.
+  let pend = c.pending
+  conns[int(slot)] = Conn(gen: gen, pending: pend, wantFree: true)
   dec openCount
   maybeFreeSlot(slot)
 
@@ -588,26 +524,8 @@ proc finalizeConn(slot: cint) =
 proc initAcceptedSlot(slot: cint) =
   ## Bring a freshly acquired fixed-file slot into service.  Recv storage is
   ## pooled, so there is nothing per-connection to allocate here.
-  var c = addr conns[int(slot)]
-  c.active = true
-  c.slot = slot
   inc gGen
-  c.gen = gGen
-  c.inbuf.setLen(0)
-  c.outbuf.setLen(0)
-  c.outOff = 0
-  c.keepAlive = true
-  c.closing = false
-  c.readPaused = false
-  c.recvArmed = false
-  c.sendArmed = false
-  c.wantFree = false
-  c.pending = 0
-  c.recvStarved = false
-  c.deferred = false
-  c.batchFrom = 0
-  c.batchCount = 0
-  c.lastActive = gNow
+  conns[int(slot)] = Conn(active: true, gen: gGen, keepAlive: true, lastActive: gNow)
   inc openCount
 
 proc onAccept(res: cint, more: bool) =
@@ -646,6 +564,7 @@ proc onAccept(res: cint, more: bool) =
         return
       # Registered: the fixed table now holds its own reference, so release the
       # process fd immediately (this is the RLIMIT_NOFILE bypass).
+      applyTcpTuning(res)
       discard posix.close(res)
 
     gAcceptMsProven = true
@@ -943,6 +862,12 @@ proc runLoop() =
     elif gDeferredSlots.len > 0:
       flushDeferredSlots(true)
 
+    # Checkpoint the WAL off the request path, at most once a second.
+    if gNow - gLastCkpt >= 1.0:
+      gLastCkpt = gNow
+      if gDb != nil:
+        gDb.checkpointPassive()
+
     # Buffers returned during this pass may have un-starved recvs that hit
     # -ENOBUFS earlier in the same pass.
     if gRecvStarved.len > 0 and gConsumedThisPass > 0 and gBufsReady > 0:
@@ -951,59 +876,7 @@ proc runLoop() =
 # ---------------------------------------------------------------------------
 # setup
 
-proc raiseNofile() =
-  ## Raise this process's soft RLIMIT_NOFILE to its hard limit before registering
-  ## the fixed-file table. `IORING_REGISTER_FILES` needs one fd slot per entry, so
-  ## a 65535 soft limit cannot accommodate a 65536-entry table; raising the soft
-  ## limit (per-process, no sysctl) removes that mismatch, and FixedSlots is also
-  ## kept below the common 65535 ceiling. No-op when soft == hard.
-  var rl: RLimit
-  if getrlimit(RLIMIT_NOFILE, rl) != 0:
-    stderr.writeLine("getrlimit(RLIMIT_NOFILE) failed: errno=" & $(lastErrno()))
-    return
-  let soft0 = rl.rlim_cur
-  let hard = rl.rlim_max
-  if soft0 < hard:
-    var want: RLimit
-    want.rlim_cur = hard
-    want.rlim_max = hard
-    if setrlimit(RLIMIT_NOFILE, want) == 0:
-      var after: RLimit
-      discard getrlimit(RLIMIT_NOFILE, after)
-      stderr.writeLine("RLIMIT_NOFILE raised: soft " & $soft0 & " -> " &
-                       $after.rlim_cur & " (hard " & $after.rlim_max & ")")
-    else:
-      stderr.writeLine("setrlimit(RLIMIT_NOFILE) failed: errno=" & $(lastErrno()))
-  else:
-    stderr.writeLine("RLIMIT_NOFILE soft==hard==" & $soft0 & " (nothing to raise)")
 
-proc setupListener(cfg: Config): cint =
-  let fd = cint(posix.socket(posix.AF_INET,
-                             posix.SOCK_STREAM or SOCK_NONBLOCK, 0))
-  if fd < 0:
-    stderr.writeLine("socket() failed: " & $(lastErrno()))
-    return -1
-  var one: cint = 1
-  discard posix.setsockopt(SocketHandle(fd), posix.SOL_SOCKET,
-                           posix.SO_REUSEADDR, addr one, SockLen(sizeof(one)))
-  var sa: Sockaddr_in
-  sa.sin_family = TSa_Family(posix.AF_INET)
-  sa.sin_port = nativesockets.htons(uint16(cfg.port))
-  if posix.inet_pton(posix.AF_INET, cfg.host.cstring, addr sa.sin_addr) != 1:
-    stderr.writeLine("invalid HOST: " & cfg.host)
-    discard posix.close(fd)
-    return -1
-  if posix.bindSocket(SocketHandle(fd), cast[ptr SockAddr](addr sa),
-                      SockLen(sizeof(sa))) != 0:
-    stderr.writeLine("bind() failed on " & cfg.host & ":" & $cfg.port &
-                     ": " & $(lastErrno()))
-    discard posix.close(fd)
-    return -1
-  if posix.listen(SocketHandle(fd), cint(ListenBacklog)) != 0:
-    stderr.writeLine("listen() failed: " & $(lastErrno()))
-    discard posix.close(fd)
-    return -1
-  fd
 
 proc groupCommitEnabled(): bool =
   ## GROUP_COMMIT defaults ON; only "0" (or unparseable -> default) is treated
@@ -1130,7 +1003,10 @@ proc main() =
   # IOURING_ACCEPT_DIRECT=0 forces the register-per-accept path so the fallback
   # can be exercised.
   gAcceptDirect = getEnv("IOURING_ACCEPT_DIRECT", "1") != "0"
-  if not gAcceptMultishot:
+  # Direct accept installs the socket kernel-side, so no userspace fd exists to
+  # run applyTcpTuning on it. If per-connection TCP tuning is requested, fall
+  # back to register-per-accept so the accepted fd is available.
+  if not gAcceptMultishot or tcpNotsentLowatBytes() > 0 or tcpQuickAck():
     gAcceptDirect = false
 
   # Raise the fd ceiling BEFORE registering the fixed-file table (see raiseNofile).
@@ -1160,7 +1036,8 @@ proc main() =
   initPool()
 
   # ---- listener -----------------------------------------------------------
-  let lfd = setupListener(cfg)
+  # Shared socket/bind/listen; io_uring does not use TCP_DEFER_ACCEPT (deferSec=0).
+  let lfd = setupListenSocket(cfg.host, cfg.port, ListenBacklog, 0)
   if lfd < 0:
     quit(1)
 
@@ -1174,7 +1051,6 @@ proc main() =
   except IoRingError as ex:
     stderr.writeLine("IORING_REGISTER_FILES failed: " & ex.msg)
     quit(1)
-  gListenRawFd = lfd
   # The registered reference keeps the listening socket alive, so the process
   # fd can be released: accepts then address it as fixed slot 0.
   discard posix.close(lfd)

@@ -86,7 +86,7 @@ if [ ! -f "$VENDOR/sqlite3.c" ] || [ ! -f "$VENDOR/sqlite3.h" ]; then
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
-  if ! curl -fsSL -o "$tmp/sqlite.zip" "$SQLITE_URL"; then
+  if ! curl -fsSL --retry 3 --retry-delay 2 -o "$tmp/sqlite.zip" "$SQLITE_URL"; then
     echo "download failed: $SQLITE_URL" >&2
     exit 1
   fi
@@ -132,7 +132,7 @@ if [ ! -f "$NIMCRYPTO_DIR/nimcrypto.nim" ]; then
   done
   tmpc="$(mktemp -d)"
   trap 'rm -rf "$tmpc"' EXIT
-  if ! curl -fsSL -o "$tmpc/nimcrypto.tar.gz" "$NIMCRYPTO_URL"; then
+  if ! curl -fsSL --retry 3 --retry-delay 2 -o "$tmpc/nimcrypto.tar.gz" "$NIMCRYPTO_URL"; then
     echo "download failed: $NIMCRYPTO_URL" >&2
     exit 1
   fi
@@ -278,7 +278,7 @@ build_one() {
 # The epoll server is built FIRST and UNCONDITIONALLY: it is the always-available
 # fallback and must exist before the io_uring binary is produced, so a failed
 # io_uring build can never leave the submission without a server.
-build_one src/server.nim bin/server
+build_one src/server_epoll.nim bin/server
 
 # ---------------------------------------------------------------------------
 # io_uring transport (DEFAULT), built from src/server_iouring.nim.

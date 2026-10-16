@@ -20,7 +20,7 @@ Correctness (fast, no external services):
 ```bash
 bash install.sh          # pinned Nim toolchain
 bash build.sh            # compiles bin/server (SQLite vendored in-tree)
-bash test/run.sh submissions/nim-epoll-NioHast     # 42/42, byte-exact
+bash test/run.sh submissions/nim-io_uring-NioHast  # 42/42, byte-exact
 ```
 
 Load (the repo's own harness):
@@ -80,8 +80,10 @@ churn (RSS grows by a few MiB, fd count stable).
 
 - **No reverse proxy.** Nginx costs 14-20 % of the single core.
 - **One event loop, no worker pool.** No thread hand-off or per-request objects.
-- **Statements prepared once** (`SQLITE_PREPARE_PERSISTENT`); SQL never re-parses.
-- **mmap + a small page cache** so reads come from the OS page cache.
+- **Statements prepared once** (`SQLITE_PREPARE_PERSISTENT`, `SQLITE_ENABLE_QPSG`); SQL never re-parses.
+- **mmap + a small page cache** (`SQLITE_MMAP_SIZE`, default 1 GiB) so reads come from the OS page cache.
+- **WAL checkpoint off the hot path** (`wal_autocheckpoint=0` + a ~1/s PASSIVE checkpoint): no request
+  pays a checkpoint fsync.
 - **One `send` per response**, with `EPOLLOUT` backpressure for slow readers.
 - **Idle eviction + RST** keep the connection count far above the fd/conntrack caps.
 - **Vendored SQLite with trims** (`THREADSAFE=0`, `OMIT_*`, JSON1) and a
@@ -102,6 +104,31 @@ submission #86 saw multishot recv fail a 275,000-user p99 screen (1,187.6 ms) wh
 passed at p99 90.9 ms - a population this box cannot reach - which is exactly why the one-shot escape
 hatch is kept, while multishot stays the default for the scored workload. The epoll fallback is
 unaffected either way.
+
+## Before/after: consolidation + tuning passes
+
+After the initial submission, the code was consolidated (behaviour-preserving) and
+given opt-in tuning: a shared `src/engine.nim` now holds the socket setup, the fd
+bump and the `processRequests` loop; dead code was removed; the WAL checkpoint was
+moved off the request path (`wal_autocheckpoint=0` + a ~1/s PASSIVE checkpoint);
+`SQLITE_ENABLE_QPSG` was added; and `SQLITE_MMAP_SIZE` made the mmap size tunable.
+`test/run.sh` stays **42/42** on both transports.
+
+Same box, `nimbench` co-located, the server pinned to one core, median of N reps,
+an identical fresh seed copy per run, 10,000 users, 20 s each, both builds PGO:
+
+| Transport | build | rps (med) | p50 (ms) | p95 (ms) | p99 (ms) | CPU ticks (med) | RSS (KiB) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| io_uring (default) | before (as submitted) | 1150 | 0.35 | 4.54 | 380.93 | 654 | 112 |
+| io_uring (default) | after | 1152 | 0.30 | 4.00 | 331.78 | 561 | 112 |
+| epoll | before (as submitted) | 1158 | 0.45 | 4.67 | 7.30 | 954 | 101 |
+| epoll | after | 1158 | 0.40 | 4.00 | 10.88 | 891 | 101 |
+
+Throughput is unchanged because the scored workload at 10k users is bound by the
+co-located generator/box at ~1.15k req/s, far below the server's ceiling; RSS is
+identical; and the median CPU and the shared-latency percentiles are equal or
+better after. The `p99` values are noisy on a shared box (the generator competes
+for the same cores), so the medians above are indicative, not the official score.
 
 ## Honest limitations
 

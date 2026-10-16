@@ -46,17 +46,13 @@ import std/posix except accept4
 import std/nativesockets
 import std/[os, strutils, times]
 
-import config, db, api, http
+import config, db, api, engine, http
 
 # ---------------------------------------------------------------------------
 # syscall surface that std/posix does not expose (or that we want verbatim)
 
 var SOCK_NONBLOCK {.importc, header: "<sys/socket.h>".}: cint
 var SOCK_CLOEXEC  {.importc, header: "<sys/socket.h>".}: cint
-# TCP_DEFER_ACCEPT (value in seconds) is in <netinet/tcp.h>; a macro constant
-# declared the same way as SOCK_NONBLOCK/SOCK_CLOEXEC above. Applied to the
-# LISTEN socket.
-var TCP_DEFER_ACCEPT {.importc, header: "<netinet/tcp.h>".}: cint
 proc accept4(a1: SocketHandle, a2: ptr SockAddr, a3: ptr SockLen,
              flags: cint): SocketHandle {.
   importc, header: "<sys/socket.h>".}
@@ -77,9 +73,6 @@ const
   # and cannot stall.
   MaxRequest    = MaxInBuf + MaxHeader + 4
   MaxEvents     = 1024
-  ListenBacklog = 4096
-  IdleKeepAlive = 75.0
-  StallTimeout  = 30.0
   SweepMs       = 1000
   AcceptPause   = 1.0
 
@@ -112,7 +105,6 @@ type
     lastActive: float
     wantWrite:  bool
     closing:    bool   ## close once the output buffer has drained
-    readPaused: bool   ## stopped reading at the input cap with data still pending
     prev:       int    ## intrusive LRU links (index into `conns`, -1 = none)
     next:       int
     inLru:      bool   ## true iff this slot is currently on the idle-LRU list
@@ -231,22 +223,10 @@ proc closeConnMode(fd: cint, rst: bool) =
   lruUnlink(idx)
   discard epoll_ctl(gEpfd, EPOLL_CTL_DEL, fd, nil)
   discard posix.close(fd)
-  conns[idx].active = false
-  # Release (not just truncate) the buffers so a pooled slot cannot retain a
-  # megabyte of capacity across connection churn.
-  conns[idx].inbuf = ""
-  conns[idx].outbuf = ""
-  conns[idx].outOff = 0
-  conns[idx].wantWrite = false
-  conns[idx].closing = false
-  conns[idx].readPaused = false
-  conns[idx].keepAlive = false
-  conns[idx].prev = -1
-  conns[idx].next = -1
-  conns[idx].inLru = false
-  conns[idx].deferred = false
-  conns[idx].batchFrom = 0
-  conns[idx].batchCount = 0
+  # Reset the whole slot to its zero value: a fresh `Conn` releases the old
+  # buffers (ARC drops the strings instead of just truncating them) and clears
+  # every flag - exactly what the field-by-field reset did before.
+  conns[idx] = Conn()
   dec openCount
 
 proc closeConn(fd: cint) =
@@ -369,77 +349,12 @@ proc readConn(c: var Conn): ReadResult =
 # ---------------------------------------------------------------------------
 # request processing (transport-agnostic core is api.handleRequest)
 
-proc processRequests(c: var Conn): bool =
-  ## Parse and answer complete pipelined requests. Returns false when the framing
-  ## is malformed (or non-conforming) and the connection must be closed after
-  ## flushing.
-  ##
-  ## Every complete request present in `inbuf` is processed in one call: there is
-  ## no output cap and no resume state, so processing can never stall. Input size
-  ## is bounded by MaxRequest (enforced in readConn), which also bounds output.
-  #
-  # Advance through the buffer with a local read offset and compact the consumed
-  # prefix only once at the end. Front-deleting per request was O(n^2) on a large
-  # pipelined buffer (a ~1 MiB pipeline of tiny requests cost seconds of memmove).
-  var pos = 0
-  while true:
-    let hend = c.inbuf.find("\r\n\r\n", pos)
-    if hend < 0:
-      # No complete header block yet: wait for more bytes unless the pending
-      # header block is already oversized (never a valid request).
-      if c.inbuf.len - pos > MaxHeader:
-        return false
-      break
-    if hend - pos > MaxHeader:
-      return false
-
-    let head = parseHead(c.inbuf, pos, hend, MaxInBuf)
-    if not head.ok:
-      return false
-    if head.bad:
-      # Non-conforming framing (bad/conflicting Content-Length, Transfer-
-      # Encoding, ...): answer 400 and close, rather than silently treating it
-      # as CL=0 and re-parsing the body as a fresh request.
-      c.outbuf.add buildResponse(400, """{"error":"bad request"}""", false)
-      c.closing = true
-      return false
-    if head.contentLen > MaxInBuf:
-      return false
-
-    let totalLen = (hend - pos) + 4 + head.contentLen
-    if c.inbuf.len - pos < totalLen:
-      break                  # body not fully arrived
-    var rawBody = ""
-    if head.contentLen > 0:
-      let b = hend + 4
-      rawBody = c.inbuf[b ..< b + head.contentLen]
-    pos += totalLen
-
-    var resp: ApiResponse
-    try:
-      resp = handleRequest(gDb, gSecret, head.httpMethod, head.path, head.auth, rawBody)
-    except Exception as ex:
-      # Exception covers Defect as well (OverflowDefect, IndexDefect, ...): no
-      # request may ever abort the single-threaded process.
-      stderr.writeLine("request handler error: " & ex.msg)
-      resp = ApiResponse(status: 500, body: """{"error":"internal server error"}""")
-
-    c.keepAlive = head.keepAlive
-    let respStart = c.outbuf.len
-    c.outbuf.add buildResponse(resp.status, resp.body, head.keepAlive)
-    # Record responses produced while a group-commit batch is open: they must not
-    # be sent until that batch commits, and become 500 if it fails to commit.
-    if gDb != nil and gDb.batchOpen():
-      if c.batchCount == 0:
-        c.batchFrom = respStart
-      inc c.batchCount
-    if not head.keepAlive:
-      c.closing = true
-      break
-
-  if pos > 0:
-    c.inbuf.delete(0 ..< pos)
-  true
+proc processRequests(c: var Conn): bool {.inline.} =
+  ## Thin adapter over the shared engine loop (`engine.nim`), so the epoll and
+  ## io_uring transports run byte-identical request handling. maxOutBuf = 0: the
+  ## epoll path drains everything buffered in one pass.
+  engine.processRequests(c.inbuf, c.outbuf, c.keepAlive, c.closing, c.outOff,
+                         c.batchFrom, c.batchCount, gDb, gSecret, MaxInBuf, 0)
 
 # ---------------------------------------------------------------------------
 # per-connection event handling
@@ -582,23 +497,10 @@ proc doAccept(now: float) =
     if int(nfd) >= conns.len:
       conns.setLen(int(nfd) + 1)
     let idx = int(nfd)
-    conns[idx].fd = nfd
-    conns[idx].active = true
-    conns[idx].inbuf.setLen(0)
-    conns[idx].outbuf.setLen(0)
-    conns[idx].outOff = 0
-    conns[idx].keepAlive = true
-    conns[idx].lastActive = now
-    conns[idx].wantWrite = false
-    conns[idx].closing = false
-    conns[idx].readPaused = false
-    conns[idx].prev = -1
-    conns[idx].next = -1
-    conns[idx].inLru = false
-    conns[idx].deferred = false
-    conns[idx].batchFrom = 0
-    conns[idx].batchCount = 0
+    conns[idx] = Conn(fd: nfd, active: true, keepAlive: true,
+                      lastActive: now, prev: -1, next: -1)
     inc openCount
+    applyTcpTuning(nfd)
 
     var ev: EpollEvent
     ev.events = uint32(EPOLLIN) or uint32(EPOLLET)
@@ -643,69 +545,12 @@ proc envInt(name: string, dflt: int): int =
   except ValueError:
     result = dflt
 
-proc raiseNofile() =
-  ## Raise this process's soft RLIMIT_NOFILE up to its hard limit. This is a
-  ## per-process limit only (no kernel/sysctl change) and is a no-op when the
-  ## soft limit already equals the hard limit, which is the case when the
-  ## server is started under `ulimit -n N`.
-  var rl: RLimit
-  if getrlimit(RLIMIT_NOFILE, rl) != 0:
-    stderr.writeLine("getrlimit(RLIMIT_NOFILE) failed: errno=" & $errno)
-    return
-  let soft0 = rl.rlim_cur
-  let hard = rl.rlim_max
-  if soft0 < hard:
-    var want: RLimit
-    want.rlim_cur = hard
-    want.rlim_max = hard
-    if setrlimit(RLIMIT_NOFILE, want) == 0:
-      var after: RLimit
-      discard getrlimit(RLIMIT_NOFILE, after)
-      stderr.writeLine("RLIMIT_NOFILE raised: soft " & $soft0 & " -> " &
-                       $after.rlim_cur & " (hard " & $after.rlim_max & ")")
-    else:
-      stderr.writeLine("setrlimit(RLIMIT_NOFILE) failed: errno=" & $errno &
-                       " (soft=" & $soft0 & " hard=" & $hard & ")")
-  else:
-    stderr.writeLine("RLIMIT_NOFILE soft==hard==" & $soft0 & " (nothing to raise)")
-
 proc setupListener(cfg: Config): bool =
-  gListenFd = cint(posix.socket(posix.AF_INET,
-                                posix.SOCK_STREAM or SOCK_NONBLOCK, 0))
+  # Shared socket/bind/listen; the epoll path additionally applies
+  # TCP_DEFER_ACCEPT (TCP_DEFER_ACCEPT_SEC=0 disables it).
+  gListenFd = setupListenSocket(cfg.host, cfg.port, ListenBacklog,
+                                envInt("TCP_DEFER_ACCEPT_SEC", 1))
   if gListenFd < 0:
-    stderr.writeLine("socket() failed: " & $errno)
-    return false
-
-  var one: cint = 1
-  discard posix.setsockopt(SocketHandle(gListenFd), posix.SOL_SOCKET,
-                           posix.SO_REUSEADDR, addr one, SockLen(sizeof(one)))
-
-  # TCP_DEFER_ACCEPT: the kernel does not make a completed handshake acceptable
-  # until the client sends its first byte (or this many seconds pass). HTTP
-  # clients send immediately, so accept still fires at once, while a connection
-  # that handshakes and stays silent never consumes an accept wakeup. Applies to
-  # the listen socket; TCP_DEFER_ACCEPT_SEC=0 disables it.
-  let deferSec = envInt("TCP_DEFER_ACCEPT_SEC", 1)
-  if deferSec > 0:
-    var dv: cint = cint(deferSec)
-    discard posix.setsockopt(SocketHandle(gListenFd), posix.IPPROTO_TCP,
-                             TCP_DEFER_ACCEPT, addr dv, SockLen(sizeof(dv)))
-
-  var sa: Sockaddr_in
-  sa.sin_family = TSa_Family(posix.AF_INET)
-  sa.sin_port = nativesockets.htons(uint16(cfg.port))
-  if posix.inet_pton(posix.AF_INET, cfg.host.cstring, addr sa.sin_addr) != 1:
-    stderr.writeLine("invalid HOST: " & cfg.host)
-    return false
-
-  if posix.bindSocket(SocketHandle(gListenFd), cast[ptr SockAddr](addr sa),
-                      SockLen(sizeof(sa))) != 0:
-    stderr.writeLine("bind() failed on " & cfg.host & ":" & $cfg.port &
-                     ": " & $errno)
-    return false
-
-  if posix.listen(SocketHandle(gListenFd), cint(ListenBacklog)) != 0:
-    stderr.writeLine("listen() failed: " & $errno)
     return false
 
   gEpfd = epoll_create1(EPOLL_CLOEXEC)
@@ -735,6 +580,8 @@ proc runLoop() =
   ## The one epoll event loop.
   conns = newSeq[Conn](64)
   var events: array[MaxEvents, EpollEvent]
+  var lastCkpt = 0.0
+  let parkMs = envInt("EPOLL_PARK_US", 0) div 1000
 
   while true:
     let n = epoll_wait(gEpfd, addr events[0], cint(MaxEvents), cint(SweepMs))
@@ -763,7 +610,19 @@ proc runLoop() =
       # Defensive: a withheld connection can only exist inside an open batch.
       flushDeferred(true)
 
+    # Checkpoint the WAL off the request path, at most once a second.
+    if now - lastCkpt >= 1.0:
+      lastCkpt = now
+      if gDb != nil:
+        gDb.checkpointPassive()
+
     sweep(now)
+
+    # Optional adaptive batching (EPOLL_PARK_US>0, default off): when a pass
+    # carried almost nothing, park briefly so the next wait can batch more
+    # arrivals, trading a little latency at low load for fewer wake-ups.
+    if parkMs > 0 and int(n) < 32:
+      sleep(parkMs)
 
 proc main() =
   let cfg = loadConfig()

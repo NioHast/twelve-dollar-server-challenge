@@ -219,9 +219,7 @@ const
 
   # sqe opcodes
   IORING_OP_NOP* = 0'u8
-  IORING_OP_POLL_ADD* = 6'u8
   IORING_OP_ACCEPT* = 13'u8
-  IORING_OP_CLOSE* = 19'u8
   IORING_OP_SEND* = 26'u8
   IORING_OP_RECV* = 27'u8
   IORING_OP_PROVIDE_BUFFERS* = 31'u8
@@ -243,16 +241,12 @@ const
   # cqe->flags
   IORING_CQE_F_BUFFER* = 1'u32 shl 0
   IORING_CQE_F_MORE* = 1'u32 shl 1
-  IORING_CQE_F_SOCK_NONEMPTY* = 1'u32 shl 2
   IORING_CQE_BUFFER_SHIFT* = 16
 
   # io_uring_register(2) opcodes
-  IORING_REGISTER_BUFFERS* = 0
   IORING_REGISTER_FILES* = 2
   IORING_UNREGISTER_FILES* = 3
-  IORING_REGISTER_FILES_UPDATE* = 6
   IORING_REGISTER_PBUF_RING* = 22
-  IORING_UNREGISTER_PBUF_RING* = 23
 
   # NB: the provided-buffer ring here is always allocated by the caller
   # (page-aligned mmap) and registered with flags=0; the kernel-managed
@@ -291,8 +285,6 @@ type
     sqkTail*: ptr uint32
     sqkMask*: ptr uint32
     sqkEntries*: ptr uint32
-    sqkFlags*: ptr uint32
-    sqkDropped*: ptr uint32
     sqArray*: ptr uint32
     cqkHead*: ptr uint32
     cqkTail*: ptr uint32
@@ -396,8 +388,6 @@ proc setupQueue*(entries: cuint, flags: uint32 = 0'u32): Ring =
   result.sqkTail = cast[ptr uint32](at(result.sqRing, p.sq_off.tail))
   result.sqkMask = cast[ptr uint32](at(result.sqRing, p.sq_off.ring_mask))
   result.sqkEntries = cast[ptr uint32](at(result.sqRing, p.sq_off.ring_entries))
-  result.sqkFlags = cast[ptr uint32](at(result.sqRing, p.sq_off.flags))
-  result.sqkDropped = cast[ptr uint32](at(result.sqRing, p.sq_off.dropped))
   result.sqArray = cast[ptr uint32](at(result.sqRing, p.sq_off.array))
 
   result.cqkHead = cast[ptr uint32](at(result.cqRing, p.cq_off.head))
@@ -530,17 +520,6 @@ proc registerBufRing*(r: Ring, ringAddr: pointer, entries: uint32,
     let e = cint(osLastError().int)
     raise newIoRingError("io_uring_register(PBUF_RING)",
                          "entries=" & $entries & " bgid=" & $bgid, e)
-  result = int(ret)
-
-proc unregisterBufRing*(r: Ring, bgid: uint16): int =
-  ## IORING_UNREGISTER_PBUF_RING: tear down a provided-buffer ring.
-  var reg = BufReg(bgid: bgid)
-  let ret = c_syscall(SYS_io_uring_register, cast[clong](r.fd),
-                      cast[clong](IORING_UNREGISTER_PBUF_RING),
-                      cast[clong](cast[uint](addr reg)), clong(1))
-  if ret < 0:
-    let e = cint(osLastError().int)
-    raise newIoRingError("io_uring_unregister(PBUF_RING)", "bgid=" & $bgid, e)
   result = int(ret)
 
 proc prepProvideBuffers*(sqe: ptr Sqe, bufAddr: uint64, bufLen: uint32,

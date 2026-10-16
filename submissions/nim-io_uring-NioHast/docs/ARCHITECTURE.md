@@ -47,8 +47,9 @@ per-request object graph, no worker hand-off.
 | File | Responsibility |
 |---|---|
 | `src/server_iouring.nim` | the DEFAULT `io_uring` transport: multishot accept/recv, provided-buffer pool, registered fds, group commit, run-time epoll fallback |
-| `src/server.nim` | the always-built FALLBACK epoll transport: accept, read, write, keep-alive, timeouts, LRU eviction, EMFILE backoff |
+| `src/server_epoll.nim` | the always-built FALLBACK epoll transport: accept, read, write, keep-alive, timeouts, LRU eviction, EMFILE backoff |
 | `src/http.nim` | shared, transport-agnostic HTTP/1.1 request parsing + response framing (used by both transports) |
+| `src/engine.nim` | shared scaffold used by both transports: `raiseNofile`, listening-socket setup, and the `processRequests` loop |
 | `src/iouring.nim` | self-contained raw `io_uring` bindings (no liburing) |
 | `src/api.nim` | routing + the five endpoints + exact error semantics; transport-agnostic |
 | `src/db.nim` | all SQL; prepared statements; pragmas; read/write lifecycle |
@@ -58,10 +59,12 @@ per-request object graph, no worker hand-off.
 | `src/model.nim` | the shared `Post` value type |
 | `src/config.nim` | environment-only configuration |
 
-The transports (`server_iouring.nim` / `server.nim`) are the only part that knows
+The transports (`server_iouring.nim` / `server_epoll.nim`) are the only part that knows
 about sockets, and they share the HTTP parsing and response framing in `http.nim`.
-`api.nim` takes plain strings in and returns a status + body, so both transports
-and the unit tests share one implementation of the API.
+They also share the fd-limit bump, the listening-socket setup and the
+`processRequests` request/response loop through `engine.nim`, so the two copies
+cannot drift. `api.nim` takes plain strings in and returns a status + body, so
+both transports and the unit tests share one implementation of the API.
 
 ## Request lifecycle
 
@@ -158,7 +161,10 @@ and run time (a failed `io_uring_setup` re-execs `bin/server`).
   `SQLITE_PREPARE_PERSISTENT`.
 - Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`,
   `foreign_keys=ON`, `temp_store=MEMORY`, `cache_size=-8000`,
-  `mmap_size=1 GiB`, `wal_autocheckpoint=1000`, `locking_mode=EXCLUSIVE`.
+  `mmap_size=1 GiB` (`SQLITE_MMAP_SIZE`), `wal_autocheckpoint=0`,
+  `locking_mode=EXCLUSIVE`.
+- WAL checkpointing is explicit and off the request path: autocheckpoint is off,
+  and a PASSIVE checkpoint runs at most once a second from the loop after a write.
 - Durability: a write is committed before its response is sent; `NORMAL` survives
   a process crash and never corrupts the file.
 
