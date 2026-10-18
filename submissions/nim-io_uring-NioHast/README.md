@@ -1,8 +1,8 @@
 # Nim: direct HTTP/1.1 on SQLite (the $12 Server Challenge)
 
 A small Twitter-style API (feed, posts, likes) implemented in **Nim 2.2.12**, built from source,
-served **directly** on `:80` with a hand-written, single-threaded **io_uring** event loop, over an
-in-process **SQLite** database.
+served **directly** on `:80` with a hand-written, single-request-thread **io_uring** event loop, over
+an in-process **SQLite** database.
 
 ```bash
 sudo bash install.sh                     # root: pinned Nim toolchain -> /opt/nim
@@ -13,11 +13,21 @@ SQLITE_PATH=/path/feed.db JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 Environment: `SQLITE_PATH`, `JWT_SECRET`, `HOST`, `PORT` (defaults `127.0.0.1:3000`). The server is
 healthy well within the 60 s the rules allow.
 
+## Stack
+
+| Layer | Choice |
+|---|---|
+| Language | **Nim 2.2.12**, pinned by `install.sh` |
+| HTTP | **no web framework**; hand-written HTTP/1.1 parsing and response framing in `src/http.nim` |
+| Database | **SQLite 3.54.0**, vendored amalgamation compiled in-tree through hand-written raw `{.importc.}` bindings in `src/sqlite3.nim`; **no system `libsqlite3`** |
+| Serving | the single binary binds **directly on `:80`**; no reverse proxy |
+
 ## Documentation
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: the event loop, modules, request lifecycle, invariants and connection limits.
 - **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)**: what was measured, how to reproduce it, and the honest limitations.
 - **[docs/DEPENDENCIES.md](docs/DEPENDENCIES.md)**: every runtime and build dependency, where it comes from, and how it is pinned.
+- **[docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)**: the complete implemented-optimization inventory, including the low-level transport/SQLite/JSON techniques.
 
 ## Transport
 
@@ -26,7 +36,7 @@ healthy well within the 60 s the rules allow.
 
 | Transport | How it is selected | What it adds |
 |---|---|---|
-| **io_uring** | the build; nothing to select | one thread, completion-queue driven; provided-buffer receive pool; a fixed-file table sized at startup from `RLIMIT_NOFILE`, so accepted sockets hold no new process fd (the table itself is charged to the limit once, at registration) |
+| **io_uring** | the build; nothing to select | one request thread, completion-queue driven; provided-buffer receive pool; a fixed-file table sized at startup from `RLIMIT_NOFILE`, so accepted sockets hold no new process fd (the table itself is charged to the limit once, at registration) |
 
 ```bash
 bash build.sh                            # builds the single bin/server
@@ -46,11 +56,13 @@ structural features matter here:
   and hold no new process `RLIMIT_NOFILE` slot (the table is sized at startup and charged to the
   limit once, at registration);
 - **multishot accept/recv over a shared provided-buffer pool** - idle connections hold no recv
-  buffer, so per-connection memory stays tiny.
+  buffer, so per-connection memory stays tiny; complete requests are parsed in place from the
+  provided buffer and only an incomplete request is copied into the connection input buffer.
 
-It keeps CPU low at high user counts with tight p50/p95/p99 tails. Per-feature failures short of a
-missing ring (a rejected setup flag, no multishot recv, no multishot/direct accept, no buf ring)
-degrade in place without a restart.
+It keeps CPU low at high user counts with tight p50/p95/p99 tails. A rejected setup flag, a refused
+multishot/direct accept and an unavailable buf ring degrade in place without a restart. Multishot
+recv is required: a kernel without `IORING_RECV_MULTISHOT` needs the manual `IOURING_RECV=oneshot`
+path (there is no runtime recv fallback).
 
 ## Toggles
 
@@ -60,7 +72,8 @@ Build time (`build.sh`):
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PGO` | `1` (on) | `PGO=0` builds without PGO: faster and deterministic, but ~16-20% more CPU per request |
+| `BUILD_VARIANT` | `control` | `control` compiles with `-d:release` and keeps every runtime check on. `danger` compiles with `-d:danger` and drops bounds/overflow/range checks plus `assert`; it exists for an A/B only and is **not** shipped |
+| `PGO` | `1` (on) | `PGO=0` builds without PGO: faster and deterministic, but about 16-20% more CPU per request |
 | `PGO_TRAIN_ITERS` | `60` | PGO training iterations (larger = more representative profile, slower build) |
 | `PGO_TRAIN_PORT` | `34999` | TCP port the PGO training server binds on `127.0.0.1` |
 | `NIM_JOBS` | `0` (auto) | value passed to `nim c --parallelBuild`; `0` auto-detects the core count |
@@ -69,27 +82,35 @@ Run time (environment for `start.sh`):
 
 | Variable | Default | Effect |
 |---|---|---|
-| `IOURING_RECV` | `multishot` | `oneshot` re-arms a one-shot recv (the p99 escape hatch) |
-| `IOURING_ACCEPT` | `multishot` | `oneshot` re-arms a one-shot accept |
+| `IOURING_RECV` | `multishot` | `oneshot` re-arms a one-shot recv (manual path for kernels without multishot recv; no runtime fallback) |
+| `IOURING_ACCEPT` | `multishot` | `oneshot` re-arms a one-shot accept (manual; accept also falls back automatically if refused) |
 | `IOURING_ACCEPT_DIRECT` | `1` (on) | `0` forces the register-per-accept path instead of direct fixed-slot accept |
-| `IOURING_BUFS` | `64` | provided-buffer pool size; rounded down to a power of two, clamped to `[64, 8192]` |
+| `IOURING_BUFS` | `64` for one ring | per-ring provided-buffer pool size; auto-split for multiple rings; rounded down to a power of two, clamped to `[64, 8192]` |
 | `IOURING_BUFRING` | `1` (on) | `0` forces the `IORING_OP_PROVIDE_BUFFERS` list instead of the registered buf ring |
 | `GROUP_COMMIT` | `1` (on) | `0` disables write group commit (per-request autocommit) |
-| `TCP_DEFER_ACCEPT_SEC` | `1` | Seconds the kernel waits for the first client byte before accepting; `0` disables |
 | `SQLITE_MMAP_SIZE` | `1073741824` | SQLite `mmap_size` in bytes (1 GiB); `0` disables mmap |
 | `TCP_NOTSENT_LOWAT_BYTES` | `0` (off) | Cap the unsent write queue per connection (e.g. `131072`); this forces the register-per-accept path |
 | `TCP_QUICKACK` | `0` (off) | `1` sets `TCP_QUICKACK` on accepted sockets; this forces the register-per-accept path |
+| `NIM_RINGS` | auto | Override the auto-sized ring count (clamped to 1..5); operational A/B escape hatch, leave unset normally |
+| `NIM_SLOTS_PER_RING` | auto | Override each ring's registered-file table size (clamped to 16,384..65,535); operational A/B escape hatch |
+| `ZEROCOPY_STATS` | `0` (off) | `1` logs the receive-path diagnostic counters (direct requests, copied buffers) once per second |
 
 Configuration: `SQLITE_PATH`, `JWT_SECRET`, `HOST`, `PORT` (default `127.0.0.1:3000`).
 
-Everything else is deliberately fixed in code and not tunable at run time: one thread per process,
-persistent prepared statements, WAL + `synchronous=NORMAL`, the 4096 listen backlog, EMFILE backoff,
-the 1 s idle/stall sweep (75 s idle / 30 s stalled), the O(n) parser, and off-path WAL checkpoints.
+`NIM_RINGS` and `NIM_SLOTS_PER_RING` only matter when a run genuinely needs more capacity than one
+fixed-file table; the auto-sizer picks the ring count from `RLIMIT_NOFILE` and the machine's
+conntrack limit.
+
+Everything else is deliberately fixed in code and not tunable at run time: one request thread plus one
+checkpoint thread per process, persistent prepared statements, WAL + `synchronous=NORMAL`, the 4096
+listen backlog, EMFILE backoff, the 1 s idle/stall sweep (75 s idle / 30 s stalled), the 1 s
+`TCP_DEFER_ACCEPT` wait (always one second), the O(n) parser, and off-path WAL checkpoints.
 
 ## Architecture
 
-One process, **one thread**, one event loop, io_uring. On a 1 vCPU box more threads only add context
-switches; one loop keeps latency predictable and memory per connection tiny.
+One process, **one request thread**, one io_uring event loop, plus a dedicated WAL-checkpoint
+thread. On a 1 vCPU box more request threads only add context switches; one loop keeps latency
+predictable and memory per connection tiny, and the checkpointer never touches request state.
 
 ```
       io_uring completion queue
@@ -110,7 +131,7 @@ switches; one loop keeps latency predictable and memory per connection tiny.
       db.nim ── sqlite3.nim (raw C API) ── in-process SQLite (WAL)
               │
               ▼
-      one write per response  (backpressure / registered-fd send)
+      one SEND per drained output buffer  (backpressure / registered-fd send)
 ```
 
 | File | Responsibility |
@@ -120,6 +141,7 @@ switches; one loop keeps latency predictable and memory per connection tiny.
 | `src/iouring.nim` | self-contained raw io_uring bindings (no liburing) |
 | `src/api.nim` | routing + the five endpoints + exact error semantics |
 | `src/db.nim` | all SQL; prepared statements; pragmas; durability ordering |
+| `src/checkpoint.nim` | WAL checkpointer on a raw POSIX pthread with its own SQLite connection |
 | `src/sqlite3.nim` | minimal raw `{.importc.}` bindings to the vendored SQLite C API |
 | `src/jwt.nim` | base64url + HS256 HMAC verification (nimcrypto), constant-time compare |
 | `src/jsonbuf.nim` | byte-level JSON writing and minimal request-body parsing |
@@ -127,79 +149,155 @@ switches; one loop keeps latency predictable and memory per connection tiny.
 
 **Request flow:** an io_uring completion signals a connection → drain the socket → `http.nim` parses
 every complete pipelined request in place → `api.handleRequest` (auth is checked *before* any id
-parsing; every read hits SQLite) → `http.nim` frames the response bytes into the connection's output
-buffer → submit sends until the socket would block; anything left is drained on the next completion so
-a slow reader can never stall the loop.
+parsing; every read hits SQLite) → for `/feed`, `db.writeFeedResponse` writes the head and body
+straight into the connection's pooled output buffer; every other response is framed into that buffer
+by `http.nim` → submit sends until the socket would block; anything left is drained on the next
+completion so a slow reader can never stall the loop.
 
 ### Event-loop invariants
-- **Read to EAGAIN.** Each recv keeps consuming until `EAGAIN`; multishot recv re-arms from a buffer
-  pool, so no readiness edge is ever lost.
-- **Never block.** `recv`/`send`/`accept` are submitted asynchronously and never waited on inline.
+- **Read to EAGAIN.** Each recv keeps consuming until `EAGAIN`. In multishot mode the same op stays
+  armed across completions (`IORING_CQE_F_MORE`); only the terminal completion clears the
+  connection's armed flag, and arming is a no-op while an op is already armed.
+- **Load-adaptive wait (one ring).** Idle, the loop blocks for one completion. After a pass that
+  drained at least 8 completions it waits for 8 completions with a 100 us cap instead, so a sustained
+  burst amortises the enter syscall while a partial batch cannot wait longer than the cap. The armed
+  1 s timeout CQE still bounds the idle wakeup.
+- **Shared wake (more than one ring).** The request thread never enters a ring with a blocking wait
+  while another ring could have work: each ring is entered non-blocking and the loop sleeps on one
+  shared eventfd in `epoll_wait`, registered on every ring.
+- **Never spin.** `recv`/`send`/`accept` are submitted asynchronously; `EAGAIN` and `ENOBUFS` are
+  retried through events, never in a busy loop.
 - **Backpressure.** Unflushed output stays buffered and its send is re-submitted until the socket
   accepts it, so an already-writable socket is never missed.
 - **Resource guards.** 16 KiB max header block; 1 MiB max unparsed input; idle 75 s / stalled 30 s.
 - **Sparse slot-indexed state.** Per-connection state is a small pooled `Conn` slot, indexed by the
-  fixed-file slot the socket occupies.
+  fixed-file slot the socket occupies. The `Conn` array reserves the table's full capacity at startup
+  but commits length only as slots are first used, so RSS follows live connections.
 
 ## Performance optimizations
 
+The measured 64k, 30-minute soak, and k6 results are recorded in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md), together with the limitations of the local test box.
+
 **Transport and architecture**
 - **No reverse proxy.** Nginx costs 14-20% of the single core; serving HTTP directly avoids that overhead.
-- **io_uring transport, one thread.** A single loop over one completion queue; no worker pool, no
+- **io_uring transport, one request thread.** A single loop over the completion queues; no worker pool, no
   thread handoff, no per-request object graph. Registering fds, multishot accept/recv and a shared
   provided-buffer pool keep CPU low at high user counts with tight tail latency.
-- **Runtime-sized fixed-file table.** At startup the table is sized from `RLIMIT_NOFILE` as
-  `min(hard - reserve, CAP)` with `CAP = 65536` and a 64-fd reserve, so the process-fd wall does not
-  cap held connections and the size is printed in the startup log rather than hard-coded. If the
-  kernel refuses the top size, startup steps the table down to a floor instead of exiting.
+- **Runtime-sized fixed-file table.** At startup each table is sized from `RLIMIT_NOFILE` as
+  `min(hard - 64, 65535)`, and the size is printed in the startup log rather than hard-coded. On the
+  target 65,535 hard limit that registers 65,471 slots; slot 0 is the listener, leaving 65,470 for
+  accepted sockets. The `Conn` array reserves that full capacity once, then commits slots lazily as
+  they are used. If the kernel refuses the top size, startup steps the table down in small increments
+  to a 16,384 floor instead of exiting.
+- **Auto-sized multi-ring capacity.** A single ring covers the current ~64k conntrack ceiling, so the
+  default is exactly one ring. When the fd or conntrack limits rise, the same request thread can own
+  up to 5 rings, each with its own registered table and `SO_REUSEPORT` listener, for about 327k fixed
+  slots. Every ring has its own `RingCtx`, and every CQE's `user_data` carries its ring id; slots are
+  per-ring. Rings add capacity, not request parallelism: there is still one request thread.
 - **CQ headroom and overflow handling.** `IORING_SETUP_CQSIZE` asks for 4x the SQ entries (16384 CQEs
   against 4096 SQEs) so a completion burst near the connection ceiling cannot stall the loop; the
   kernel's reported `cq_entries` is logged. If the CQ still fills, the loop uses
   `IORING_SQ_CQ_OVERFLOW` and re-enters non-blocking to move parked completions back.
 - **Provided-buffer receive pool (64 x 8 KiB).** Multishot recv draws from one shared, lazily-faulted
-  pool, so idle connections hold no recv buffer.
-- **One write per response**, with backpressure (the send is re-submitted until the socket accepts)
-  so a slow reader never stalls the loop. A 64 KiB output cap (`MaxOutBuf`) stops the parser once that
-  much is buffered, so a deep pipeline cannot pin a large heap buffer per connection.
-- **Adaptive completion wait.** A pass that drained a batch of completions waits under a short timeout
-  so queued sends are flushed promptly; an empty pass returns to the blocking wait.
-- **Listener-level TCP options.** `TCP_DEFER_ACCEPT` (1 s) and `TCP_NODELAY` are set once on the
-  listener, so accepted sockets inherit them with no per-connection `setsockopt` and direct accept
-  stays enabled.
+  pool, so idle connections hold no recv buffer. Multi-ring splits a fixed 4,096-buffer global budget
+  across the rings by default, instead of multiplying it.
+- **One SEND per drained output buffer.** A send carries every response byte currently buffered, so a
+  pipelined batch can leave in one call; a partial send re-arms the remainder, and `EAGAIN`/`ENOBUFS`
+  are retried rather than dropping the connection. A 64 KiB output cap (`MaxOutBuf`) stops the parser
+  once that much is buffered, so a deep pipeline cannot pin a large heap buffer per connection.
+- **Load-adaptive completion wait.** After arming the next operations the loop drains the entire
+  completion queue in one pass. When the previous pass drained at least 8 completions it waits for 8
+  completions with a 100 us cap (`IORING_ENTER_EXT_ARG`); otherwise it blocks for one completion.
+  Completions already queued count towards the batch, so a backlog is never delayed, and the armed
+  1 s timeout CQE bounds the idle wakeup. There is no separate adaptive timer.
+- **Multi-ring wake path.** With more than one ring the request thread uses a non-blocking
+  submit/enter on every ring plus one shared eventfd registered on each ring, waited on in a single
+  `epoll_wait`. One ring keeps `DEFER_TASKRUN`; multi-ring drops it because deferred task work needs
+  an enter that the eventfd sleep would never issue.
+- **Listener-level TCP options.** `TCP_DEFER_ACCEPT` (always 1 s) and `TCP_NODELAY` are set once on
+  each listener, so accepted sockets inherit them with no per-connection `setsockopt` and direct
+  accept stays enabled.
 
 **Data path**
-- **One SQLite connection, statements prepared once.** Statements use `SQLITE_PREPARE_PERSISTENT`; SQL
-  never re-parses, and `SQLITE_ENABLE_QPSG` keeps the plan stable if a statement is ever re-prepared.
-- **Dense-range feed scan with a decline path.** When the top-20 feed ids fit a small dense id window,
-  the feed is rebuilt from three cheap range lookups; otherwise the loop falls back to the original
+- **One request connection, statements prepared once.** Statements use `SQLITE_PREPARE_PERSISTENT`;
+  SQL never re-parses, and `SQLITE_ENABLE_QPSG` keeps the query plan stable if a statement is ever
+  re-prepared. The checkpoint thread has its own separate connection and runs no data-modifying statements: one `journal_size_limit` PRAGMA, one schema-prime read, and checkpoint API calls.
+- **One read transaction per pass.** The first read of an event-loop pass opens a single
+  `BEGIN DEFERRED`; every read in that pass runs inside it, and `endRead` COMMITs at the pass boundary,
+  so no stale snapshot survives a pass. The WAL checkpoint is independent and runs on its own
+  connection/thread.
+- **Dense-range feed scan with a decline path.** The feed first reads the top-20 ids in feed order.
+  When those ids fit a small dense window, likes and rows are read by id range: `SqlFeedRows` carries
+  `WHERE p.id BETWEEN ? AND ?` with `minId`/`maxId` bound (a bounded `feed_rows` shape),
+  so the feed is rebuilt from three cheap range lookups. Otherwise, and whenever the joined rows do
+  not line up with the top-20 ids, the loop falls back to the original
   `ORDER BY created_at DESC, id DESC LIMIT 20` query, kept verbatim, so the output is byte-identical.
-- **Zero-allocation JSON write path.** Response bytes are written straight into the connection's output
-  buffer (escaped string runs bulk-copied, integers written digit by digit), with no intermediate
-  per-element string.
+- **Direct feed writer, low-allocation JSON.** `src/jsonbuf.nim` writes escaped string runs in bulk
+  and integers digit by digit. For `GET /feed`, `db.writeFeedJson` reads SQLite columns and writes the
+  JSON directly into the response buffer, and `db.writeFeedResponse` writes the head and body straight
+  into the pooled output buffer with a 128-byte head reserve. There is no `seq[Post]` and no
+  intermediate body string: the steady-state feed path makes 0 Nim-visible allocations per response,
+  and the in-process A/B measured 0.001 allocations per feed response (occasional buffer growth)
+  against 3.0 for the old body-string path. Every other endpoint builds one body string
+  per response, which `addResponse` appends to the output buffer. A single SQLite statement using
+  `json_object`/`json_group_array` is not used because it was 1.78-2.00x slower than the
+  dense Nim writer.
+- **Borrowed header spans.** `parseHead` extracts method, path, `Authorization` and headers as
+  offsets into the request buffer. It never copies or allocates, and pipelined requests advance a
+  cursor instead of front-deleting the buffer.
+- **Canonical-body fast path.** A byte scanner decodes the common `{"body":"..."}` payload directly;
+  any other shape falls back to `std/json` so the exact semantics are preserved.
+- **Fixed stack JWT scratch.** The token is a borrowed span in the request buffer. Header, payload
+  and signature decode into a fixed `JwtScratch` sized from the 16 KiB header cap, and HMAC runs over
+  the contiguous `header.payload` bytes with no concatenation. The canonical
+  `{"alg":"HS256","typ":"JWT"}` header takes a byte-match fast path, and the payload is scanned in
+  place. The only heap allocation is the decoded `username`, which is response data. A per-request
+  an arena is not used; borrowed spans plus this stack scratch keep the same work on the stack.
 - **mmap + a small page cache.** Reads come from the OS page cache (size via `SQLITE_MMAP_SIZE`,
-  default 1 GiB); the SQLite cache stays small (`cache_size=-1000`, kept after measurement).
-- **WAL checkpoint off the hot path.** Autocheckpoint is disabled (`wal_autocheckpoint=0`) and a
-  **PASSIVE** checkpoint runs at most once a second from the idle branch of the loop, so no request
-  pays a checkpoint fsync; `journal_size_limit` still bounds the `-wal` file.
+  default 1 GiB); the SQLite page cache is deliberately tiny at `cache_size=-64` (64 KiB). A paired
+  A/B at 64k against the earlier 1 MiB cache (`cache_size=-1000`) with the same 1 GiB mmap kept p95
+  identical, improved CPU by ~1.5 points and dropped RSS by 1-2 MiB, so the 64 KiB cache ships.
+- **Off-loop WAL checkpoint.** Autocheckpoint is disabled (`wal_autocheckpoint=0`). A dedicated
+  pthread owns a second SQLite connection (the library is built `SQLITE_THREADSAFE=2`; each
+  connection is `NOMUTEX` and the database runs `locking_mode=NORMAL`). The request connection's
+  `wal_hook` only raises a flag; from there the worker runs a **PASSIVE** checkpoint at most once per
+  second (coalesced), and the request loop never checkpoints. No request pays a checkpoint copy or
+  fsync.
+- **WAL-growth trade-off.** PASSIVE never blocks the writer, but it also cannot reset the WAL while a
+  saturated writer keeps the log ahead of it. At a saturated 64k mixed load the WAL grows about
+  140 MiB per minute (measured maxima ~143-225 MiB in 60 s); 32k paced settles at the 64 MiB
+  `journal_size_limit`, and a feed-only 64k run stays around 6.6 MiB. Budget roughly 1 GiB of free
+  disk for a 5-minute 64k hold. This is disk headroom, not a durability or memory loss: every commit
+  is still durable before its response.
 - **Write group commit** (default on): writes issued during one event-loop pass share a single
   transaction that commits before any dependent response is sent (`synchronous=NORMAL`, the documented
   floor the rules allow).
 - **Compact `Conn`.** Per-connection state is a pooled slot of 80 bytes (the boolean facts are packed
   into one `set[ConnFlag]`), so the slot array stays small.
+- **Pooled output buffers, released at idle.** An output buffer is taken from a small bounded pool
+  only while a response is being built, and returned once the SEND that carried it has fully
+  completed. An idle keep-alive connection holds no output storage; the pool keeps at most 128 buffers
+  and retains only buffers up to 64 KiB. Large input buffers are dropped too: after a drained burst an
+  idle connection retains at most 4 KiB of input capacity, and anything larger is freed.
 - **O(n) request parsing**: the input buffer is walked with a cursor and compacted once per event, so a
   large pipelined buffer is parsed in O(n) rather than O(n^2).
 
 **Build**
+- **Control build by default; `danger` is opt-in only.** The default is `BUILD_VARIANT=control`
+  (`-d:release`), which keeps bounds, overflow and range checks on. `BUILD_VARIANT=danger` switches to
+  `-d:danger` for an A/B; a microbenchmark measured ~4.4% fewer user instructions per `GET /feed`,
+  but no 64k end-to-end comparison has been run, so the unchecked variant is not shipped.
 - **Profile-guided optimization (PGO)**: a two-pass build trained on a short synthetic workload, with a
   plain-build fallback when PGO is unavailable.
 - **Native + LTO + SQLite trims**: `-O3 -march=native -fno-semantic-interposition -fno-plt
-  --stacktrace:off` and `-d:lto`, with SQLite compiled `THREADSAFE=0` and trimmed (`USE_ALLOCA=1`,
+  --stacktrace:off` and `-d:lto`, with SQLite compiled `THREADSAFE=2` (request loop + one checkpoint thread, one connection each) and trimmed (`USE_ALLOCA=1`,
   `LIKE_DOESNT_MATCH_BLOBS`, `OMIT_DECLTYPE`, `OMIT_AUTOINIT`, `OMIT_*`, `DQS=0`, JSON1). See [Build](#build).
 
 **Capacity**
 - **Large listen backlog (4096), EMFILE backoff** (the acceptor pauses and retries on the next tick),
-  a runtime-sized registered-fd table, and a 1 s idle/stall sweep (see
-  [Peak connections](#peak-connections-the-real-limit)).
+  a runtime-sized registered-fd table, auto-sized multi-ring capacity when the limits rise, and a 1 s
+  idle/stall sweep (see [Peak connections](#peak-connections-the-real-limit)).
 
 
 ## Peak connections (the real limit)
@@ -209,19 +307,28 @@ latency. Two kernel limits sit under that number, and only one of them is a proc
 
 - **Process file descriptors.** The target box gives the service `LimitNOFILE=65535`, which cannot be
   raised from inside the process. Registering the fixed-file table charges its entries against
-  `RLIMIT_NOFILE`, so the table is sized `min(hard - 64, 65536)` and accepted sockets then hold no new
-  process fd: the per-connection fd wall is gone, but the table size is still bounded by the limit.
+  `RLIMIT_NOFILE`, so the table is sized `min(hard - 64, 65535)`. On that 65,535 hard limit it
+  registers 65,471 slots: slot 0 is the listener, leaving 65,470 slots for accepted sockets. Accepted
+  sockets then hold no new process fd: the per-connection fd wall is gone, but the table size is
+  still bounded by the limit.
 - **Kernel connection tracking (conntrack).** The droplet's `nf_conntrack_max` is about 64k on 2 GB.
   That table is machine-wide and is **not** lifted by registered fds or by anything the server can do
   in-process. It is the practical ceiling for simultaneous established connections as seen from the
   target environment.
 
+Both limits can move up without changing the server: on a host where the fd or conntrack ceiling
+exceeds one fixed-file table, the auto-sizer raises the ring count (up to 5 rings, each with its own
+`SO_REUSEPORT` listener and registered table, ~327k slots total). The request thread still owns every
+ring; rings add capacity, not parallelism.
+
 The loop keeps per-connection cost low so that this ceiling, not memory or CPU, binds first: a shared
 provided-buffer receive pool (64 buffers of 8 KiB, so idle connections hold no recv buffer), an
-80-byte `Conn` slot, and a compact runtime-sized slot array. The 4096 listen backlog absorbs reconnect
-bursts and EMFILE backoff pauses the acceptor (it never spins); a 1 s sweep closes connections that
-have been idle for 75 s or stalled for 30 s, which also keeps the open-connection count bounded over a
-long run.
+80-byte `Conn` slot, and a slot array that reserves the full table capacity once but commits slots
+lazily as they are used. An idle connection also keeps at most 4 KiB of input capacity (larger input
+buffers are dropped) and no output buffer, because output storage is pooled and released after the
+terminal SEND. The 4096 listen backlog absorbs reconnect bursts and EMFILE backoff pauses the acceptor
+(it never spins); a 1 s sweep closes connections that have been idle for 75 s or stalled for 30 s,
+which also keeps the open-connection count bounded over a long run.
 
 **Honesty about the numbers.** The ~64k conntrack ceiling is argued from the target environment
 (`LimitNOFILE=65535`, a 2 GB droplet), not measured here. Local load tests run over **loopback**,
@@ -241,8 +348,8 @@ The server is built so that **no request can crash it** and every per-event oper
 
 - **No request aborts the process.** The request handler is wrapped so that any exception, including
   `Defect`s such as integer-overflow from hostile input (e.g. `GET /posts/99999999999999999999999`),
-  is answered with `500` instead of propagating. Request ids are range-checked *before* the multiply,
-  so over-long ids return `400`. (An earlier revision could be killed by one crafted id; this is fixed.)
+  is answered with `500` instead of propagating. Request ids are capped at 19 digits and range-checked
+  *before* the multiply, so over-long ids return `400` instead of overflowing.
 - **Strict framing.** `Content-Length` must be all digits (no sign, no empty, no conflicting duplicate);
   `Transfer-Encoding` is rejected. Bad framing → `400` + close, never a body re-parsed as a request.
 - **Bounded input.** Buffered *unparsed* input per connection is capped (about 1 MiB plus the header
@@ -276,9 +383,12 @@ the database stays uncorrupted. `synchronous=OFF` (which can corrupt the file) i
 - **Nim flags:** `--threads:off --mm:arc -d:release -d:lto --stacktrace:off` plus
   `--parallelBuild:${NIM_JOBS:-0}` (0 auto-detects the core count), plus
   `--passC:"-O3 -march=native -fno-semantic-interposition -fno-plt"` and `--passL:"-Wl,-O1"`.
-  Runtime checks are intentionally **kept on** (`-d:release`, never `-d:danger`): a crash during the
-  benchmark must never happen, and the check cost is negligible next to the syscall and SQL work.
-- **SQLite trims:** `-DSQLITE_THREADSAFE=0` (the server is single-threaded), `-DSQLITE_DQS=0`,
+  Runtime checks are intentionally **kept on** by the default `BUILD_VARIANT=control`: a crash during
+  the benchmark must never happen, and the check cost is negligible next to the syscall and SQL work.
+  `BUILD_VARIANT=danger` is an opt-in A/B variant only; it is not the default and is not shipped.
+  PGO is on by default and runs through the same two-pass pipeline for both variants.
+- **SQLite trims:** `-DSQLITE_THREADSAFE=2` (one connection per thread: the request loop and the
+  off-loop WAL checkpointer; both are opened `SQLITE_OPEN_NOMUTEX`), `-DSQLITE_DQS=0`,
   `-DSQLITE_DEFAULT_MEMSTATUS=0`, `-DSQLITE_USE_ALLOCA=1`, `-DSQLITE_LIKE_DOESNT_MATCH_BLOBS`,
   `-DSQLITE_OMIT_DECLTYPE`, `-DSQLITE_OMIT_AUTOINIT` (with one `sqlite3_initialize()` in `openDb`),
   `-DSQLITE_OMIT_DEPRECATED`, `-DSQLITE_OMIT_LOAD_EXTENSION`, `-DSQLITE_OMIT_PROGRESS_CALLBACK`,
@@ -287,24 +397,41 @@ the database stays uncorrupted. `synchronous=OFF` (which can corrupt the file) i
 
 ## Testing
 
-- `bash test/run.sh submissions/nim-io_uring-NioHast`: the official 42-check suite, byte-exact. It
-  builds `bin/server` and runs it via `start.sh`.
-- Unit tests under `tests/`: `test_db.nim` (queries vs the seed DB and the `sqlite3` CLI),
-  `test_jwt.nim` (HS256 against `openssl` vectors), `test_iouring.nim` (io_uring ABI + SQE/CQE round-trip).
+- `bash test/run.sh submissions/nim-io_uring-NioHast`: the official **42-check** suite, byte-exact.
+  It builds `bin/server` and runs it via `start.sh`. All 42 checks pass.
+- Unit tests under `tests/`: `test_db.nim` (queries vs the seed DB, plus the
+  checkpoint start/stop/queued-work/concurrent lifecycle),
+  `test_jwt.nim` (HS256 against `openssl` vectors), `test_iouring.nim` (io_uring ABI + SQE/CQE
+  round-trip), `test_body.nim` (request-body parsing and its `std/json` fallback),
+  `test_jsonbuf.nim` (JSON writing and escaping), `test_feed_writer.nim` (direct feed serialization,
+  byte-for-byte against the previous writer), and `test_feed_response.nim` (full feed head+body and
+  pipelined framing).
+- Harnesses and helpers under `tests/`: `feed_equality.sh` (GET /feed against the golden bytes and the top-of-feed
+  after a write, byte-for-byte; **7/7** pass), `bench_escape.nim` (escaping benchmark), `commit_failure.sh`
+  (write-lock failure: POST returns 500 and no row persists), `conn_churn.sh` (connection
+  churn), `conn_deferred_close.sh` (close with output still buffered), `conn_lifetime_soak.sh`
+  (long-lived idle/stalled connection soak), `zerocopy_direct.sh` (direct provided-buffer parsing and
+  partial-request carry), `fallback_matrix.sh` (env-forced transport variants under the churn/feed
+  harnesses), and `multiring_smoke.sh` (the multi-ring completion-wake regression and pipelined mixed
+  write).
+- The two correctness gates are the **42/42** official suite and the **7/7 feed-equality** harness.
 
 ## Development notes
 
 Before writing the event loop the author **reverse-engineered `mummy`**, a fast,
 multi-threaded Nim HTTP/1.1 server, to study how it wires an event loop, per-connection
-buffers and keep-alive, then implemented this single-threaded server from scratch.
+buffers and keep-alive, then implemented this single-request-thread server from scratch.
 No `mummy` code is used, imported, or shipped.
 
 ## Compliance (challenge rules)
 
 - **SQLite only**: every read/write is in-process SQLite (rule 2); no in-memory store, no external
-  cache.
-- **No caching across requests** (rule 5), no response cache; JSON and like counts are computed per
-  request. Prepared statements and the SQLite page cache are allowed and used.
+  cache. There are exactly two connections, the request connection and the checkpoint connection,
+  both inside this process.
+- **No caching across requests** (rule 5): no response cache, no query cache, and no in-memory copy
+  of any table. Every request reads SQLite; the only state reused across requests is SQLite's own
+  page cache (`cache_size=-64`, 64 KiB), the OS page cache through `mmap_size=1 GiB`, and prepared
+  statements. JSON and like counts are computed per request.
 - **Durable before responding** (rule 6), commit before the response; no `synchronous=OFF`.
 - **No hard-coded responses / no benchmark detection** (rule 7), everything derives from SQLite.
 - **Nginx optional / direct** (rule 9), direct bind.
@@ -318,10 +445,13 @@ No `mummy` code is used, imported, or shipped.
 ```
 submissions/nim-io_uring-NioHast/
   install.sh  build.sh  start.sh  README.md  .gitignore  config.nims
-  docs/   ARCHITECTURE.md  PERFORMANCE.md  DEPENDENCIES.md
+  docs/   ARCHITECTURE.md  PERFORMANCE.md  DEPENDENCIES.md  OPTIMIZATIONS.md
   src/    server.nim iouring.nim http.nim
           api.nim db.nim sqlite3.nim jwt.nim jsonbuf.nim model.nim config.nim
-  tests/  test_db.nim test_jwt.nim test_iouring.nim
+  tests/  test_db.nim test_jwt.nim test_iouring.nim test_body.nim test_jsonbuf.nim
+          test_feed_writer.nim test_feed_response.nim
+          bench_escape.nim feed_equality.sh conn_churn.sh conn_deferred_close.sh
+          conn_lifetime_soak.sh commit_failure.sh fallback_matrix.sh multiring_smoke.sh
   tools/  pgo_train.sh pgo_flush.c gen_synth_db.c
   vendor/ (downloaded by build.sh; gitignored)   bin/ nimcache/ (gitignored)
 ```

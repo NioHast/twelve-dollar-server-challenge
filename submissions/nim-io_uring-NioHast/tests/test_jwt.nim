@@ -111,6 +111,66 @@ block:
   let (status, _) = verifyJwt(token, JwtSecret)
   check("no-username", status == jsBadPayload)
 
+# 7. Non-canonical headers still follow std/json semantics (the fast path only
+#    covers the exact official header bytes).
+block:
+  let p = payloadJson("1", "golden_ember_1", now + 3600)
+  check("header-key-order",
+        verifyJwt(makeToken(p, headerJson = """{"typ":"JWT","alg":"HS256"}"""),
+                  JwtSecret).status == jsOk)
+  check("header-whitespace",
+        verifyJwt(makeToken(p, headerJson = """{ "alg" : "HS256" , "typ" : "JWT" }"""),
+                  JwtSecret).status == jsOk)
+  check("header-extra-keys",
+        verifyJwt(makeToken(p, headerJson = """{"alg":"HS256","typ":"JWT","kid":"k1"}"""),
+                  JwtSecret).status == jsOk)
+  check("header-duplicate-alg-last-hs256",
+        verifyJwt(makeToken(p, headerJson = """{"alg":"none","alg":"HS256"}"""),
+                  JwtSecret).status == jsOk)
+  check("header-duplicate-alg-last-none",
+        verifyJwt(makeToken(p, headerJson = """{"alg":"HS256","alg":"none"}"""),
+                  JwtSecret).status == jsInvalid)
+
+# 8. Escaped sub: \u0031 decodes to "1" and is a valid positive integer.
+block:
+  let p = """{"sub":"\u0031","username":"golden_ember_1","exp":""" &
+          $(now + 3600) & "}"
+  let (status, info) = verifyJwt(makeToken(p), JwtSecret)
+  check("escaped-sub", status == jsOk and info.userId == 1)
+
+# 9. Unicode username: BMP escape + surrogate pair decode to UTF-8.
+block:
+  let p = """{"sub":"1","username":"caf\u00e9 \ud83d\ude00","exp":""" &
+          $(now + 3600) & "}"
+  let (status, info) = verifyJwt(makeToken(p), JwtSecret)
+  check("unicode-username", status == jsOk and info.username == "café 😀")
+
+# 10. A lone high surrogate is malformed JSON -> jsInvalid (not jsBadPayload).
+block:
+  let p = """{"sub":"1","username":"\ud800","exp":""" & $(now + 3600) & "}"
+  let token = makeToken(p)
+  check("lone-surrogate", verifyJwt(token, JwtSecret).status == jsInvalid)
+
+# 11. exp comparison: epochTime() > exp rejects; equality is accepted. Pass an
+#     explicit `now` so the boundary is exact, not wall-clock dependent.
+block:
+  let fixedNow = 1_700_000_000.0
+  let atNow = makeToken("""{"sub":"1","username":"u","exp":1700000000.0}""")
+  check("exp-equal-now-float", verifyJwt(atNow, JwtSecret, fixedNow).status == jsOk)
+  let atNowInt = makeToken("""{"sub":"1","username":"u","exp":1700000000}""")
+  check("exp-equal-now-int", verifyJwt(atNowInt, JwtSecret, fixedNow).status == jsOk)
+  let past = makeToken("""{"sub":"1","username":"u","exp":1699999999.999}""")
+  check("exp-1ms-past", verifyJwt(past, JwtSecret, fixedNow).status == jsInvalid)
+
+# 12. Signature length != 32 is rejected even before constant-time compare.
+block:
+  let h = b64url(Hs256Header)
+  let p = b64url("""{"sub":"1","username":"u","exp":""" & $(now + 3600) & "}")
+  check("sig-31-bytes", verifyJwt(h & "." & p & "." & b64url("x".repeat(31)),
+                                  JwtSecret).status == jsInvalid)
+  check("sig-33-bytes", verifyJwt(h & "." & p & "." & b64url("y".repeat(33)),
+                                  JwtSecret).status == jsInvalid)
+
 if failures > 0:
   echo "FAILURES: ", failures
   quit(1)

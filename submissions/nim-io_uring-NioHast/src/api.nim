@@ -1,11 +1,16 @@
 ## Transport-agnostic request handling: routing, auth ordering, exact error semantics.
 ## Implements the contract in SPEC.md / test/test.sh byte-for-byte.
 import std/[strutils, times]
-import model, db, jwt, jsonbuf
+import db, jwt, jsonbuf, http
 
 type ApiResponse* = object
   status*: int
   body*: string
+  ## The server writes this response's body directly into the connection output
+  ## buffer (`db.writeFeedResponse`) because the body is large and would
+  ## otherwise be built as a throwaway string and copied. `body` is empty when
+  ## this is set. Every other endpoint leaves it false and uses `body`.
+  feedDirect*: bool
 
 const
   ErrNotFound     = """{"error":"not found"}"""
@@ -29,7 +34,7 @@ proc uptimeSeconds*(): int64 =
 proc jsonRes(status: int, body: string): ApiResponse =
   ApiResponse(status: status, body: body)
 
-proc parsePositiveId(s: string): tuple[ok: bool, id: int64] =
+proc parsePositiveId(buf: openArray[char]; s: Span): tuple[ok: bool, id: int64] =
   ## Accept only ASCII digits forming a value >= 1 that fits in int64.
   ##
   ## Overflow guard: int64 holds at most 19 decimal digits, and the check below
@@ -40,7 +45,8 @@ proc parsePositiveId(s: string): tuple[ok: bool, id: int64] =
   ## `len > 19` cap and the digit-aware bound).
   if s.len == 0 or s.len > 19: return (false, 0'i64)
   var v: int64 = 0
-  for c in s:
+  for i in 0 ..< s.len:
+    let c = buf[s.off + i]
     if c < '0' or c > '9': return (false, 0'i64)
     let d = int64(ord(c) - ord('0'))
     if v > (9_223_372_036_854_775_807'i64 - d) div 10:
@@ -56,11 +62,11 @@ type
     userId: int64
     username: string
 
-proc doAuth(authHeader, secret: string): Auth =
-  if not authHeader.startsWith("Bearer "):
+proc doAuth(buf: openArray[char]; authHeader: Span; secret: string): Auth =
+  if not spanStartsWith(buf, authHeader, "Bearer "):
     return Auth(kind: akMissing)
-  let token = authHeader[7 .. ^1]
-  let (status, info) = verifyJwt(token, secret)
+  let token = subSpan(authHeader, 7, authHeader.len)
+  let (status, info) = verifyJwt(buf, token, secret)
   case status
   of jsOk:      Auth(kind: akOk, userId: info.userId, username: info.username)
   of jsInvalid: Auth(kind: akInvalid)
@@ -73,37 +79,35 @@ proc authResponse(a: Auth): ApiResponse =
   of akBadPayload: jsonRes(401, ErrBadPayload)
   of akOk:         ApiResponse(status: 0, body: "")  # sentinel; never used
 
-proc postEnvelope(p: Post): string =
-  result = """{"post":"""
-  result.writePost(p)
-  result.add '}'
-
-proc handleRequest*(database: Db, jwtSecret, httpMethod, path, authHeader, rawBody: string): ApiResponse =
-  if httpMethod == "GET":
-    if path == "/health":
+proc handleRequest*(database: Db; jwtSecret: string; reqBuf: openArray[char];
+                    httpMethod, path, authHeader: Span;
+                    rawBody: string): ApiResponse =
+  if spanEq(reqBuf, httpMethod, "GET"):
+    if spanEq(reqBuf, path, "/health"):
       if database.health():
         return jsonRes(200, """{"status":"ok","db":"ok","uptime_s":""" & $uptimeSeconds() & "}")
       else:
         return jsonRes(503, """{"status":"degraded","db":"unreachable","error":"db unreachable"}""")
-    if path == "/feed":
-      var posts: seq[Post]
-      database.feed(posts)
-      var b = ""
-      b.writeFeed(posts)
-      return jsonRes(200, b)
-    if path.startsWith("/posts/"):
-      let pid = parsePositiveId(path[7 .. ^1])
+    if spanEq(reqBuf, path, "/feed"):
+      # The transport writes the feed body straight into the pooled response
+      # buffer; no intermediate body string is built here.
+      return ApiResponse(status: 200, feedDirect: true)
+    if spanStartsWith(reqBuf, path, "/posts/"):
+      let pid = parsePositiveId(reqBuf, subSpan(path, 7, path.len))
       if not pid.ok: return jsonRes(400, ErrInvalidId)
-      var p: Post
-      if database.getPost(pid.id, p):
-        return jsonRes(200, postEnvelope(p))
+      # The DB writes the complete `{"post":...}` body straight from the row
+      # columns (no Post object, column strings or re-escaping); `body` stays
+      # empty on a miss, so the 404 bytes are unchanged.
+      var body = ""
+      if database.writePostJson(pid.id, body):
+        return jsonRes(200, body)
       else:
         return jsonRes(404, ErrPostNotFound)
     return jsonRes(404, ErrNotFound)
 
-  if httpMethod == "POST":
-    if path == "/posts":
-      let a = doAuth(authHeader, jwtSecret)          # auth BEFORE body validation
+  if spanEq(reqBuf, httpMethod, "POST"):
+    if spanEq(reqBuf, path, "/posts"):
+      let a = doAuth(reqBuf, authHeader, jwtSecret)          # auth BEFORE body validation
       if a.kind != akOk: return authResponse(a)
       let pb = parseBody(rawBody)
       case pb.kind
@@ -113,16 +117,26 @@ proc handleRequest*(database: Db, jwtSecret, httpMethod, path, authHeader, rawBo
         let trimmed = pb.body.strip
         if trimmed.len == 0: return jsonRes(400, ErrBodyRequired)
         if trimmed.len > 500: return jsonRes(400, ErrTooLong)
-        var p: Post
-        if database.createPost(a.userId, a.username, trimmed, p):
-          return jsonRes(201, postEnvelope(p))
+        # The DB writes the complete `{"post":...}` body straight from the
+        # inserted row's values; no Post object or second escaping pass.
+        var body = ""
+        if database.createPostResponseBody(a.userId, a.username, trimmed, body):
+          return jsonRes(201, body)
         else:
           return jsonRes(500, ErrInternal)
-    if path.startsWith("/posts/") and path.endsWith("/like"):
-      let a = doAuth(authHeader, jwtSecret)          # auth BEFORE id validation
+    if spanStartsWith(reqBuf, path, "/posts/") and spanEndsWith(reqBuf, path, "/like"):
+      let a = doAuth(reqBuf, authHeader, jwtSecret)          # auth BEFORE id validation
       if a.kind != akOk: return authResponse(a)
-      let mid = path[7 ..< path.len - 5]
-      let pid = parsePositiveId(mid)
+      # "/posts/like" satisfies both the "/posts/" prefix and the "/like"
+      # suffix, so the id slice `path[7 ..< path.len - 5]` has its end before
+      # its start. The frozen baseline raises RangeDefect there, which the
+      # request loop maps to 500; preserve that exact wire behavior without
+      # constructing a negative-length span.
+      let midEnd = path.len - 5
+      if midEnd < 7:
+        return jsonRes(500, ErrInternal)
+      let mid = subSpan(path, 7, midEnd)
+      let pid = parsePositiveId(reqBuf, mid)
       if not pid.ok: return jsonRes(400, ErrInvalidId)
       case database.like(a.userId, pid.id)
       of loLiked:

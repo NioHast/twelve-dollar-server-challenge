@@ -28,10 +28,12 @@
 ##
 ## ============================== SQE/CQE protocol =============================
 ##
-##  1. Caller reserves a slot with `getSqe`.  We zero the 64-byte slot, write
-##     its index into `sq_array[sq_tail & ring_mask]`, and advance the shared
-##     `sq_tail`.  Advancing the tail before `enter` is safe because the ring is
-##     not in SQPOLL mode: the kernel only observes SQEs at `io_uring_enter`.
+##  1. Caller reserves a slot with `getSqe`.  We zero the 64-byte slot, and
+##     advance the shared `sq_tail`.  Normally the slot's index is also written
+##     into `sq_array[sq_tail & ring_mask]`; with IORING_SETUP_NO_SQARRAY that
+##     indirection does not exist and the kernel indexes the SQE array directly.
+##     Advancing the tail before `enter` is safe because the ring is not in
+##     SQPOLL mode: the kernel only observes SQEs at `io_uring_enter`.
 ##  2. `submit` flushes `to_submit` SQEs via
 ##     `io_uring_enter(fd, to_submit, min_complete=0, flags=0, ...)`.
 ##     `submitAndWait` additionally sets `IORING_ENTER_GETEVENTS` and blocks
@@ -153,6 +155,21 @@ type
     flags*: uint16          ## offset 14
     resv*: array[3, uint64] ## offset 16
 
+  IoUringTimespec* {.bycopy.} = object
+    ## struct __kernel_timespec: the timeout object IORING_ENTER_EXT_ARG
+    ## expects, addressed by `IoUringGeteventsArg.ts`.  Values are relative
+    ## (tv_sec/tv_nsec) unless IORING_ENTER_ABS_TIMER (6.12+, not used) is set.
+    tv_sec*: int64          ## offset 0
+    tv_nsec*: int64         ## offset 8
+
+  IoUringGeteventsArg* {.bycopy.} = object
+    ## struct io_uring_getevents_arg: 24 bytes (IORING_ENTER_EXT_ARG).
+    ## `ts` is a POINTER to `IoUringTimespec`, not a raw nanosecond count.
+    sigmask*: uint64        ## offset 0
+    sigmask_sz*: uint32     ## offset 8
+    pad*: uint32            ## offset 12
+    ts*: pointer            ## offset 16
+
 # Compile-time ABI contract.  If the compiler (or the platform) lays these out
 # differently than the kernel expects, the module refuses to build.
 static:
@@ -185,6 +202,15 @@ static:
   doAssert offsetOf(BufReg, ring_entries) == 8
   doAssert offsetOf(BufReg, bgid) == 12
   doAssert offsetOf(BufReg, flags) == 14
+  doAssert sizeof(IoUringTimespec) == 16, "__kernel_timespec must be 16 bytes"
+  doAssert offsetOf(IoUringTimespec, tv_sec) == 0
+  doAssert offsetOf(IoUringTimespec, tv_nsec) == 8
+  doAssert sizeof(IoUringGeteventsArg) == 24,
+    "io_uring_getevents_arg must be 24 bytes"
+  doAssert offsetOf(IoUringGeteventsArg, sigmask) == 0
+  doAssert offsetOf(IoUringGeteventsArg, sigmask_sz) == 8
+  doAssert offsetOf(IoUringGeteventsArg, pad) == 12
+  doAssert offsetOf(IoUringGeteventsArg, ts) == 16
 # ---------------------------------------------------------------------------
 # Constants (mirrored from <linux/io_uring.h>)
 # ---------------------------------------------------------------------------
@@ -209,6 +235,11 @@ const
   IORING_SETUP_COOP_TASKRUN*  = 1'u32 shl 8
   IORING_SETUP_SINGLE_ISSUER* = 1'u32 shl 12
   IORING_SETUP_DEFER_TASKRUN* = 1'u32 shl 13
+  # IORING_SETUP_NO_SQARRAY (6.6+): the kernel indexes SQEs by `tail & mask`
+  # directly, so userspace neither maps nor fills the sq_array indirection.
+  # The kernel leaves `params.sq_off.array` at zero when it accepts this flag.
+  # Bit 14 is IORING_SETUP_NO_MMAP and bit 15 is REGISTERED_FD_ONLY.
+  IORING_SETUP_NO_SQARRAY*    = 1'u32 shl 16
   # IORING_SETUP_CQSIZE: honour io_uring_params.cq_entries as the explicit CQ
   # ring size.  Without it the kernel derives cq_entries = 2 * sq_entries.
   IORING_SETUP_CQSIZE*        = 1'u32 shl 3
@@ -225,16 +256,25 @@ const
 
   # io_uring_enter(2) flags
   IORING_ENTER_GETEVENTS* = 1'u32 shl 0
+  # The sixth argument is a pointer to `struct io_uring_getevents_arg` (which
+  # carries an optional signal mask and a pointer to a relative timeout) instead
+  # of the plain sigset.  Available since 5.11; the target kernel (6.8) has it.
+  IORING_ENTER_EXT_ARG*   = 1'u32 shl 3
 
   # sqe opcodes
   IORING_OP_NOP* = 0'u8
   IORING_OP_ACCEPT* = 13'u8
+  IORING_OP_CLOSE* = 19'u8
   IORING_OP_SEND* = 26'u8
   IORING_OP_RECV* = 27'u8
   IORING_OP_PROVIDE_BUFFERS* = 31'u8
 
   # sqe->flags (IOSQE_*)
   IOSQE_BUFFER_SELECT* = 1'u8 shl 5
+  # Post no CQE when the request succeeds; a failing request still posts one.
+  # Only valid for fire-and-forget requests: a SEND/RECV success CQE is what
+  # retires its buffer/op, so it must never be skipped there.
+  IOSQE_CQE_SKIP_SUCCESS* = 1'u8 shl 6
 
   # sqe->file_index sentinel (union with splice_fd_in at Sqe offset 44).  For a
   # "direct" accept the kernel installs the new socket straight into the first
@@ -264,8 +304,10 @@ const
 
   # errno values we special-case (Linux)
   IOURING_EPERM* = 1
+  IOURING_EINTR* = 4
   IOURING_EINVAL* = 22
   IOURING_ENOSYS* = 38
+  IOURING_ETIME* = 62
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -295,7 +337,8 @@ type
     sqkMask*: ptr uint32
     sqkEntries*: ptr uint32
     sqkFlags*: ptr uint32     ## SQ ring flags; nil if the kernel exposes no offset
-    sqArray*: ptr uint32
+    sqArray*: ptr uint32      ## nil when IORING_SETUP_NO_SQARRAY is in effect
+    sqArrayUsed*: bool        ## write sq_array entries in getSqe
     cqkHead*: ptr uint32
     cqkTail*: ptr uint32
     cqkMask*: ptr uint32
@@ -316,48 +359,64 @@ template mmapFailed(p: pointer): bool = cast[int](p) == -1
 # setup / teardown
 # ---------------------------------------------------------------------------
 
+proc setupOnce(entries: cuint; flags: uint32; cqEntries: cuint;
+               p: var IoUringParams): clong =
+  ## One io_uring_setup attempt. `flags` is the exact optimisation-flag set to
+  ## try; IORING_SETUP_CQSIZE (and the requested CQ size) is added on top.
+  p = IoUringParams()
+  p.flags = flags
+  if cqEntries > 0'u32:
+    p.flags = p.flags or IORING_SETUP_CQSIZE
+    p.cq_entries = cqEntries
+  result = c_syscall(SYS_io_uring_setup, cast[clong](entries), cast[clong](addr p))
+
 proc setupQueue*(entries: cuint, flags: uint32 = 0'u32,
                  cqEntries: cuint = 0'u32): Ring =
   ## Create an io_uring with room for `entries` submissions, requesting the
-  ## setup `flags` (e.g. SINGLE_ISSUER | DEFER_TASKRUN).
+  ## setup `flags` (e.g. SINGLE_ISSUER | DEFER_TASKRUN | NO_SQARRAY).
   ##
   ## `cqEntries`, when non-zero, is requested as the explicit CQ ring size via
   ## `IORING_SETUP_CQSIZE` (must be >= `entries`; the kernel rounds to a power
   ## of two).  Without it the kernel defaults `cq_entries = 2 * sq_entries`.
   ## The size the kernel actually allocated is left in `params.cq_entries`.
   ##
-  ## If the kernel rejects a flagged setup with -EINVAL (older kernel / kernel
-  ## without that hint), the ring is retried WITHOUT the optimisation flags but
-  ## KEEPING the explicit CQ-size request, so startup never fails over a hint and
-  ## the requested headroom is not silently lost.  `usedFlags`/`flagsDropped`
+  ## If the kernel rejects a flagged setup with -EINVAL, NO_SQARRAY is stripped
+  ## FIRST and the rest of the set retried, so an older kernel loses only that
+  ## one hint.  If the remaining set is still refused, the ring is retried bare,
+  ## always KEEPING the explicit CQ-size request.  `usedFlags`/`flagsDropped`
   ## record which optimisation set actually took effect.
   ##
   ## Raises `IoRingError` (with `.errno` set) if the kernel refuses the ring
   ## outright, e.g. ENOSYS on a kernel without io_uring or EPERM under seccomp.
   var p: IoUringParams
-  p.flags = flags
-  if cqEntries > 0'u32:
-    p.flags = p.flags or IORING_SETUP_CQSIZE
-    p.cq_entries = cqEntries
-  var fd = c_syscall(SYS_io_uring_setup, cast[clong](entries), cast[clong](addr p))
   var used = flags
-  if fd < 0 and flags != 0'u32 and cint(osLastError().int) == IOURING_EINVAL:
-    # Unsupported optimisation flag: retry without it, keeping IORING_SETUP_CQSIZE.
-    p = IoUringParams()
-    if cqEntries > 0'u32:
-      p.flags = IORING_SETUP_CQSIZE
-      p.cq_entries = cqEntries
-    fd = c_syscall(SYS_io_uring_setup, cast[clong](entries), cast[clong](addr p))
-    used = 0'u32
+  var fd = setupOnce(entries, used, cqEntries, p)
+  if fd < 0 and cint(osLastError().int) == IOURING_EINVAL:
+    if (used and IORING_SETUP_NO_SQARRAY) != 0'u32:
+      # Strip only NO_SQARRAY: the kernel then needs the sq_array again.
+      used = used and not IORING_SETUP_NO_SQARRAY
+      fd = setupOnce(entries, used, cqEntries, p)
+    if fd < 0 and used != 0'u32 and cint(osLastError().int) == IOURING_EINVAL:
+      # Unsupported optimisation set: retry bare, keeping IORING_SETUP_CQSIZE.
+      used = 0'u32
+      fd = setupOnce(entries, used, cqEntries, p)
   if fd < 0:
     let e = cint(osLastError().int)
     raise newIoRingError("io_uring_setup", "entries=" & $entries, e)
 
+  let noSqArray = (used and IORING_SETUP_NO_SQARRAY) != 0'u32
   result = Ring(fd: cint(fd), params: p, requestedFlags: flags, usedFlags: used,
+                sqArrayUsed: not noSqArray,
                 flagsDropped: flags != 0'u32 and used == 0'u32)
 
-  var sqRingSize = csize_t(p.sq_off.array) +
-                   csize_t(p.sq_entries) * csize_t(sizeof(uint32))
+  var sqRingSize: csize_t
+  if noSqArray:
+    # The kernel does not map an sq_array (and leaves sq_off.array zero): the
+    # SQ mapping only needs the fixed ring header. `dropped` is its last u32.
+    sqRingSize = csize_t(p.sq_off.dropped) + csize_t(sizeof(uint32))
+  else:
+    sqRingSize = csize_t(p.sq_off.array) +
+                 csize_t(p.sq_entries) * csize_t(sizeof(uint32))
   var cqRingSize = csize_t(p.cq_off.cqes) +
                    csize_t(p.cq_entries) * csize_t(sizeof(Cqe))
   let singleMmap = (p.features and IORING_FEAT_SINGLE_MMAP) != 0'u32
@@ -414,7 +473,8 @@ proc setupQueue*(entries: cuint, flags: uint32 = 0'u32,
   # kernel advertised a non-zero offset (else offset 0 would alias sq_head).
   if p.sq_off.flags != 0'u32:
     result.sqkFlags = cast[ptr uint32](at(result.sqRing, p.sq_off.flags))
-  result.sqArray = cast[ptr uint32](at(result.sqRing, p.sq_off.array))
+  if result.sqArrayUsed:
+    result.sqArray = cast[ptr uint32](at(result.sqRing, p.sq_off.array))
 
   result.cqkHead = cast[ptr uint32](at(result.cqRing, p.cq_off.head))
   result.cqkTail = cast[ptr uint32](at(result.cqRing, p.cq_off.tail))
@@ -443,14 +503,17 @@ proc teardown*(r: Ring) =
 
 proc getSqe*(r: Ring): ptr Sqe =
   ## Reserve the next SQE slot (zeroed), or return nil if the SQ is full.
-  ## The slot index is published into sq_array and the SQ tail advanced; the
+  ## With the default sq_array the slot index is published into it; under
+  ## IORING_SETUP_NO_SQARRAY the kernel consumes `tail & mask` directly, so the
+  ## indirection store is skipped. The SQ tail is advanced either way; the
   ## kernel sees nothing until `submit`/`submitAndWait`.
   let head = r.sqkHead[]
   let tail = r.sqkTail[]
   if (tail - head) >= r.sqkEntries[]:
     return nil
   let index = tail and r.sqkMask[]
-  cast[ptr UncheckedArray[uint32]](r.sqArray)[index] = index
+  if r.sqArrayUsed:
+    cast[ptr UncheckedArray[uint32]](r.sqArray)[index] = index
   r.sqkTail[] = tail + 1'u32
   inc r.toSubmit
   result = cast[ptr Sqe](cast[uint](r.sqes) + uint(index) * uint(sizeof(Sqe)))
@@ -486,6 +549,46 @@ proc submitAndWait*(r: Ring, minComplete: cuint = 1): int =
   r.toSubmit = 0
   result = int(ret)
 
+proc submitAndWaitBatch*(r: Ring, minComplete: cuint, maxUsec: uint64): int =
+  ## Flush reserved SQEs, then wait until at least `minComplete` completions are
+  ## available or `maxUsec` microseconds have elapsed, using
+  ## `IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG`.
+  ##
+  ## `min_complete` counts completions already sitting in the CQ ring, so an
+  ## enter with enough of them queued returns immediately instead of sleeping.
+  ## A timeout with an empty CQ returns -ETIME and a signal-interrupted wait
+  ## returns -EINTR; both are normal outcomes (the caller drains whatever
+  ## arrived and carries on), not errors.  Any other negative return raises
+  ## `IoRingError` like `submitAndWait`.
+  ##
+  ## The kernel consumes the reserved SQEs before it waits, so `toSubmit` is
+  ## cleared for a submitted batch even when the wait itself times out or is
+  ## interrupted; leaving it set would re-submit SQEs the kernel already took.
+  ## On a real error it is left intact for a later re-flush, as in `submit`.
+  var ts = IoUringTimespec(
+    tv_sec: int64(maxUsec div 1_000_000'u64),
+    tv_nsec: int64((maxUsec mod 1_000_000'u64) * 1_000'u64))
+  var arg = IoUringGeteventsArg(sigmask: 0'u64, sigmask_sz: 0'u32,
+                                pad: 0'u32, ts: addr ts)
+  let to = r.toSubmit
+  let flags = IORING_ENTER_GETEVENTS or IORING_ENTER_EXT_ARG
+  let ret = c_syscall(SYS_io_uring_enter, cast[clong](r.fd), cast[clong](to),
+                      cast[clong](minComplete), cast[clong](flags),
+                      cast[clong](addr arg), cast[clong](sizeof(arg)))
+  if ret < 0:
+    let e = cint(osLastError().int)
+    if e != IOURING_EINTR and e != IOURING_ETIME:
+      raise newIoRingError("io_uring_enter(wait-batch)",
+                           "to_submit=" & $to & " min_complete=" & $minComplete &
+                           " max_usec=" & $maxUsec, e)
+    # Normal wait outcomes: report them liburing-style (-errno) so a caller can
+    # distinguish "nothing arrived in time" (-ETIME) from "interrupted"
+    # (-EINTR).  The submission itself still succeeded.
+    r.toSubmit = 0
+    return -int(e)
+  r.toSubmit = 0
+  result = int(ret)
+
 proc enterGetEvents*(r: Ring): int =
   ## Non-blocking io_uring_enter with `IORING_ENTER_GETEVENTS` and
   ## `min_complete = 0`: flushes any reserved SQEs, and if the CQ ring overflowed
@@ -493,14 +596,16 @@ proc enterGetEvents*(r: Ring): int =
   ## kernel's `io_cqring_wait` flushes the overflow list before the
   ## `min_events = 0` early return, so this never sleeps).  Use it to drain an
   ## overflow condition without stalling the loop.
+  ## `toSubmit` is cleared only on success (like `submit`): a failed enter leaves
+  ## the reserved SQEs counted so a later enter re-flushes them.
   let to = r.toSubmit
-  r.toSubmit = 0
   let ret = c_syscall(SYS_io_uring_enter, cast[clong](r.fd), cast[clong](to),
                       clong(0), cast[clong](IORING_ENTER_GETEVENTS),
                       clong(0), clong(0))
   if ret < 0:
     let e = cint(osLastError().int)
     raise newIoRingError("io_uring_enter(getevents)", "to_submit=" & $to, e)
+  r.toSubmit = 0
   result = int(ret)
 
 proc sqOverflowed*(r: Ring): bool =
@@ -528,6 +633,25 @@ proc peekCqe*(r: Ring): ptr Cqe =
 proc cqeSeen*(r: Ring) =
   ## Consume the completion previously returned by `peekCqe`.
   inc r.cqkHead[]
+
+proc cqHead*(r: Ring): uint32 {.inline.} =
+  ## Current userspace-consumed CQ position.
+  r.cqkHead[]
+
+proc cqTail*(r: Ring): uint32 {.inline.} =
+  ## Current kernel-published CQ position.
+  r.cqkTail[]
+
+proc cqeAt*(r: Ring; pos: uint32): ptr Cqe {.inline.} =
+  ## The CQE at absolute CQ position `pos` (head <= pos < tail). The entry
+  ## remains kernel-owned until `cqeSeenMany` publishes the advanced head.
+  cast[ptr Cqe](cast[uint](r.cqes) +
+                uint(pos and r.cqkMask[]) * uint(sizeof(Cqe)))
+
+proc cqeSeenMany*(r: Ring; count: uint32) {.inline.} =
+  ## Consume `count` completions in one publish. Draining a whole batch this way
+  ## replaces one head store per CQE with one per batch.
+  inc r.cqkHead[], count
 
 # ---------------------------------------------------------------------------
 # Fixed files / buffers

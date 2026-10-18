@@ -15,8 +15,20 @@
 ## verifies that hash, and extracts sqlite3.c/sqlite3.h into `vendor/`.
 ##
 ## The single C translation unit is compiled straight into the binary via
-## `{.compile.}` with size/speed trims below. `SQLITE_THREADSAFE=0` is safe here
-## because the server is single-threaded.
+## `{.compile.}` with size/speed trims below.
+##
+## THREADSAFE=2 (multi-thread mode), not 0:
+##   The request loop and the WAL checkpointer each own ONE connection, used
+##   only by their own OS thread. SQLite must not assume the whole process is
+##   single-threaded any more: with THREADSAFE=0 the library omits the
+##   global/connection serialisation that makes two connections on two threads
+##   legal (and `sqlite3_threadsafe()` reports 0). Mode 2 keeps the
+##   per-connection mutexes OUT of the hot path (both connections are opened
+##   SQLITE_OPEN_NOMUTEX), while the library's internal WAL/index coordination
+##   between connections is still compiled in. Each connection is still used by
+##   exactly one thread at a time, so no mutex is taken on the request path.
+##   openDb() verifies `sqlite3_threadsafe() == 2` and refuses to start
+##   otherwise.
 
 ## Syntax note: Nim 2.2.12 accepts the `compile` pragma as `{.compile(file,
 ## options).}` where `options` is ONE space-separated string forwarded verbatim
@@ -43,7 +55,7 @@
 ##                                  never re-plans. (added)
 ## The original flags are all preserved verbatim.
 {.compile("../vendor/sqlite3.c",
-  "-O3 -DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DQS=0 -DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_QPSG -DSQLITE_USE_ALLOCA=1 -DSQLITE_OMIT_DECLTYPE -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_AUTOINIT").}
+  "-O3 -DSQLITE_THREADSAFE=2 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DQS=0 -DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_QPSG -DSQLITE_USE_ALLOCA=1 -DSQLITE_OMIT_DECLTYPE -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_AUTOINIT").}
 
 type
   Sqlite3* {.incompleteStruct.} = object
@@ -69,13 +81,16 @@ const
   ## `SQLITE_TRANSIENT` tells sqlite to make its own copy of bound text.
   SQLITE_TRANSIENT* = cast[Sqlite3Destructor](-1)
 
-  ## `sqlite3_wal_checkpoint_v2` mode: PASSIVE never blocks on readers.
-  SQLITE_CHECKPOINT_PASSIVE* = 0
-
 ## Required exactly once before any other SQLite call when the amalgamation is
 ## built with SQLITE_OMIT_AUTOINIT (see the compile flags above). openDb() calls
 ## this before it touches the database. Calling it more than once is safe.
 proc sqlite3_initialize*(): cint
+  {.importc, header: "vendor/sqlite3.h".}
+
+## Compile-time threading mode: 0=single-thread, 2=multi-thread. openDb()
+## requires 2 because the checkpointer uses a second connection on its own
+## thread (see the THREADSAFE note at the top of this module).
+proc sqlite3_threadsafe*(): cint
   {.importc, header: "vendor/sqlite3.h".}
 
 proc sqlite3_open_v2*(filename: cstring, ppDb: ptr ptr Sqlite3, flags: cint,
@@ -109,9 +124,6 @@ proc sqlite3_column_int64*(stmt: ptr Sqlite3Stmt, iCol: cint): int64
 proc sqlite3_reset*(stmt: ptr Sqlite3Stmt): cint
   {.importc, header: "vendor/sqlite3.h".}
 
-proc sqlite3_clear_bindings*(stmt: ptr Sqlite3Stmt): cint
-  {.importc, header: "vendor/sqlite3.h".}
-
 proc sqlite3_changes*(db: ptr Sqlite3): cint
   {.importc, header: "vendor/sqlite3.h".}
 
@@ -133,8 +145,4 @@ proc sqlite3_errcode*(db: ptr Sqlite3): cint
 proc sqlite3_exec*(db: ptr Sqlite3, sql: cstring,
                    callback: Sqlite3ExecCallback, arg: pointer,
                    errmsg: ptr cstring): cint
-  {.importc, header: "vendor/sqlite3.h".}
-
-proc sqlite3_wal_checkpoint_v2*(db: ptr Sqlite3, zDb: cstring, eMode: cint,
-                                pnLog: ptr cint, pnCkpt: ptr cint): cint
   {.importc, header: "vendor/sqlite3.h".}

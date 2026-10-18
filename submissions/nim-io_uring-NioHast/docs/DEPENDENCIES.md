@@ -11,8 +11,11 @@ what happens if it is missing. See [README](../README.md) for build/run and
 | `libc` (glibc) | the only shared library the server links | Ubuntu 24.04 base | fixed by the OS release |
 
 `ldd bin/server` shows just `libc.so.6` (plus the loader/vdso): SQLite is compiled
-in-tree, threads are off, there is no `dlopen`, and libm is folded into glibc. The
-binary runs on any Ubuntu 24.04.
+in-tree, the Nim thread runtime is off, there is no `dlopen`, and libm is folded into
+glibc. The server runs one request thread plus one checkpoint thread; the
+checkpoint worker is a plain POSIX thread (`pthread_create`) implemented in
+`src/checkpoint.nim` (Nim, no C shim), which glibc provides,
+so no extra shared library appears. The binary runs on any Ubuntu 24.04.
 
 ## Build: pinned downloads (URL + sha256)
 
@@ -31,7 +34,7 @@ Installed by `install.sh`:
 
 | Tool | Role |
 |---|---|
-| `build-essential` (gcc, make, `libc6-dev`, `linux-libc-dev`) | compiles the vendored C (SQLite) and the PGO helpers; provides `<linux/io_uring.h>` and libc headers |
+| `build-essential` (gcc, make, `libc6-dev`, `linux-libc-dev`) | compiles the vendored C (SQLite) and the PGO helpers; provides libc headers and the C compiler |
 | `curl` | downloads the pinned archives; also drives the server during PGO training |
 | `xz-utils`, `ca-certificates` | extract `.tar.xz` and fetch over HTTPS |
 | `unzip` | extracts the SQLite `.zip` (fallback: `bsdtar`, then `python3`) |
@@ -45,16 +48,18 @@ individually version-pinned; they are fixed by the Ubuntu 24.04 release.
 
 There are **no external Nim packages** at build time. Every import other than the
 vendored `nimcrypto` is Nim's standard library (`os`, `strutils`, `posix`,
-`times`, `nativesockets`, `json`, `oserrors`, `osproc`, `streams`). The
-build does not use a user Nimble directory; `config.nims` adds `vendor/nimcrypto`
-to the search path.
+`posix/epoll`, `oserrors`, `times`, `json`, `bitops`, `parseutils`). The unit
+tests additionally use `osproc` and `streams` (`tests/test_jwt.nim`); neither is
+linked into the server. The build does not use a user Nimble directory;
+`config.nims` adds `vendor/nimcrypto` to the search path.
 
 ## C headers referenced
 
 `<sys/socket.h>`, `<netinet/tcp.h>`, `<errno.h>`, `<unistd.h>`, `<sys/syscall.h>`,
-`<sys/mman.h>`, `<linux/io_uring.h>` and the vendored `<sqlite3.h>`: all from glibc /
-`linux-libc-dev` (part of `build-essential`) and the vendored SQLite. No extra
-packages.
+`<sys/mman.h>`, `<pthread.h>`, `<poll.h>`, `<sys/eventfd.h>`, `<emmintrin.h>` and the
+vendored `<sqlite3.h>`: all from glibc / `linux-libc-dev` (part of `build-essential`)
+and the vendored SQLite. The io_uring structs are hand-mirrored, so
+`<linux/io_uring.h>` is not included. No extra packages.
 
 ## PGO-specific dependencies and the plain-build safety net
 

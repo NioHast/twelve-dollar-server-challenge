@@ -19,9 +19,14 @@
 ##  1. **Ring setup flags** (`IORING_SETUP_SINGLE_ISSUER | DEFER_TASKRUN`, plus
 ##     `COOP_TASKRUN`): the recommended set for a single-threaded, per-thread
 ##     ring.  Less cross-CPU locking, and completion (task) work is deferred to
-##     `io_uring_enter`, which the loop already calls every pass.  If the kernel
-##     rejects the flags with `-EINVAL` the ring is re-created without them and
-##     startup proceeds; the mode is logged.
+##     `io_uring_enter`, which the N=1 loop already calls every pass.  The
+##     multi-ring loop instead waits on a shared eventfd and cannot use
+##     `DEFER_TASKRUN`: deferred task work is only run by `io_uring_enter`, and
+##     the eventfd that should wake that loop is signalled from the completion
+##     commit, which is exactly the work being deferred.  N>1 therefore asks
+##     for `SINGLE_ISSUER | COOP_TASKRUN` only (see runMultiLoop).  If the
+##     kernel rejects a flag set with `-EINVAL` the ring is re-created without
+##     the optimisation flags and startup proceeds; the mode is logged.
 ##
 ##  2. **Direct multishot accept** (`IORING_ACCEPT_MULTISHOT` with the SQE's
 ##     `file_index = IORING_FILE_INDEX_ALLOC`): the kernel installs each accepted
@@ -29,8 +34,9 @@
 ##     `IORING_REGISTER_FILES_UPDATE` and no per-accept fd allocation are needed.
 ##     The accept CQE's `res` is the slot index.  If the kernel rejects the
 ##     direct variant (`-EINVAL`/`-EOPNOTSUPP`), we transparently fall back to
-##     the register-per-accept path.  Closing a connection still frees its slot
-##     with `FILES_UPDATE(-1)`, so the slot is reused by the next direct accept.
+##     the register-per-accept path.  Closing a connection drops its fixed-file
+##     entry with `FILES_UPDATE(-1)` only after every in-flight op on the slot
+##     has completed, so the next direct accept can safely reuse it.
 ##
 ## Fidelity
 ## --------
@@ -39,7 +45,8 @@
 ## `http.nim`, so the emitted bytes are pinned by construction. The socket is
 ## single-threaded; the event source is the io_uring completion queue.
 
-import std/[posix, os, strutils, times, nativesockets, oserrors]
+import std/[posix, os, strutils, times, oserrors]
+import posix/epoll
 
 import iouring, config, db, api, http
 
@@ -51,6 +58,9 @@ import iouring, config, db, api, http
 
 # syscall surface std/posix does not expose (or that we want verbatim)
 var SOCK_NONBLOCK {.importc, header: "<sys/socket.h>".}: cint
+# SO_REUSEPORT lets every ring bind its own listener to the same host:port; the
+# kernel then hashes each new connection to one of them (multi-ring accept).
+var SO_REUSEPORT {.importc, header: "<sys/socket.h>".}: cint
 # TCP_DEFER_ACCEPT (value in seconds) is in <netinet/tcp.h>.
 var TCP_DEFER_ACCEPT {.importc, header: "<netinet/tcp.h>".}: cint
 # TCP_NODELAY set on the listener is inherited by accepted sockets on Linux, so
@@ -138,7 +148,8 @@ proc raiseNofile*(): int =
   else:
     result = int(hard)
 
-proc setupListenSocket*(host: string; port, backlog, deferSec: int): cint =
+proc setupListenSocket*(host: string; port, backlog, deferSec: int;
+                        reusePort = false): cint =
   ## Create, bind and listen a non-blocking IPv4 socket, returning its fd (or -1,
   ## after logging, on any failure). `deferSec > 0` enables TCP_DEFER_ACCEPT
   ## before `listen`: the kernel withholds a completed handshake from `accept`
@@ -147,6 +158,12 @@ proc setupListenSocket*(host: string; port, backlog, deferSec: int): cint =
   ## TCP_NODELAY is always set on the listener, which the kernel then inherits
   ## onto every accepted socket, so the send path installs no per-connection
   ## option and the direct-accept fast path stays usable.
+  ##
+  ## `reusePort` is only set on the multi-ring path: each ring gets its own
+  ## listener on the same host:port and the kernel balances new connections
+  ## across them. The single-ring call keeps the exact same socket options as
+  ## before (SO_REUSEPORT would be a no-op there, but leaving it unset keeps
+  ## that path byte-for-byte identical).
   result = cint(posix.socket(posix.AF_INET,
                              posix.SOCK_STREAM or SOCK_NONBLOCK, 0))
   if result < 0:
@@ -155,6 +172,9 @@ proc setupListenSocket*(host: string; port, backlog, deferSec: int): cint =
   var one: cint = 1
   discard posix.setsockopt(SocketHandle(result), posix.SOL_SOCKET,
                            posix.SO_REUSEADDR, addr one, SockLen(sizeof(one)))
+  if reusePort:
+    discard posix.setsockopt(SocketHandle(result), posix.SOL_SOCKET,
+                             SO_REUSEPORT, addr one, SockLen(sizeof(one)))
   # Listener-level send tuning: TCP_NODELAY removes Nagle on each accepted
   # socket (inherited by the kernel at accept time), byte-for-byte the same
   # effect as a per-connection setsockopt without the per-accept syscall.
@@ -166,7 +186,7 @@ proc setupListenSocket*(host: string; port, backlog, deferSec: int): cint =
                              TCP_DEFER_ACCEPT, addr dv, SockLen(sizeof(dv)))
   var sa: Sockaddr_in
   sa.sin_family = TSa_Family(posix.AF_INET)
-  sa.sin_port = nativesockets.htons(uint16(port))
+  sa.sin_port = posix.htons(uint16(port))
   if posix.inet_pton(posix.AF_INET, host.cstring, addr sa.sin_addr) != 1:
     stderr.writeLine("invalid HOST: " & host)
     discard posix.close(result)
@@ -185,53 +205,85 @@ proc setupListenSocket*(host: string; port, backlog, deferSec: int): cint =
 # ---------------------------------------------------------------------------
 # request processing (the transport-agnostic core is api.handleRequest)
 
-proc processRequests*(inbuf, outbuf: var string; keepAlive, closing: var bool;
-                      outOff: int; batchFrom, batchCount: var int;
-                      database: Db; secret: string;
-                      maxInBuf, maxOutBuf: int): bool =
-  ## Parse and answer every complete pipelined request currently in `inbuf`,
-  ## appending the response bytes to `outbuf`. Returns false when the framing is
-  ## malformed (or non-conforming) and the connection must close after flushing.
+proc acquireOutBuf(buf: var string; pool: var seq[string])
+
+var
+  recvDirectRequests*: uint64
+    ## Complete requests parsed and served straight from a receive buffer.
+  recvCopiedBuffers*: uint64
+    ## Receive buffers whose bytes were copied into `Conn.inbuf`: a carried
+    ## partial, an incomplete final request, or an unconsumed tail left by the
+    ## output cap.
+
+proc processBuffer(data: openArray[char]; outbuf: var string;
+                   keepAlive, closing: var bool; outOff: int;
+                   batchFrom, batchCount: var int;
+                   database: Db; secret: string;
+                   maxInBuf, maxOutBuf: int;
+                   outPool: ptr seq[string];
+                   consumed: var int; countDirect: bool): bool =
+  ## Parse and answer every complete pipelined request in `data`, appending the
+  ## response bytes to `outbuf`. Returns false when the framing is malformed (or
+  ## non-conforming) and the connection must close after flushing.
+  ##
+  ## `data` is either a borrowed view of the kernel's provided receive buffer or
+  ## a view of `Conn.inbuf`; nothing here retains it, and every response is
+  ## fully built before the caller may return a provided buffer to the kernel.
+  ## `consumed` reports how many leading bytes were processed.
   ##
   ## `maxOutBuf` stops the loop once that many response bytes are buffered,
   ## leaving the remainder for the send-drain to finish.
+  ##
+  ## `outPool`, when supplied, is the owning ring's output pool: a buffer is
+  ## taken from it immediately before the first append to an empty, zero-capacity
+  ## `outbuf`, so a partial request never allocates one.
+  template ensureOutBuf() =
+    if outPool != nil and outbuf.len == 0 and outbuf.capacity == 0:
+      acquireOutBuf(outbuf, outPool[])
   #
   # Advance with a local offset and compact once at the end; front-deleting per
   # request was O(n^2) on a large pipelined buffer.
   var pos = 0
+  consumed = 0
   while true:
     if outbuf.len - outOff >= maxOutBuf:
       break
-    let hend = inbuf.find("\r\n\r\n", pos)
+    let hend = findHeaderEnd(data, pos)
     if hend < 0:
-      if inbuf.len - pos > MaxHeader:
+      if data.len - pos > MaxHeader:
         return false
       break
     if hend - pos > MaxHeader:
       return false
 
-    let head = parseHead(inbuf, pos, hend, maxInBuf)
+    let head = parseHead(data, pos, hend, maxInBuf)
     if not head.ok:
       return false
     if head.bad:
       # Non-conforming framing (bad/conflicting Content-Length, Transfer-
       # Encoding, ...): answer 400 and close, rather than silently treating it
       # as CL=0 and re-parsing the body as a fresh request.
+      ensureOutBuf()
       outbuf.addResponse(400, """{"error":"bad request"}""", false)
       closing = true
       return false
     let totalLen = (hend - pos) + 4 + head.contentLen
-    if inbuf.len - pos < totalLen:
+    if data.len - pos < totalLen:
       break                  # body not fully arrived
     var rawBody = ""
     if head.contentLen > 0:
       let b = hend + 4
-      rawBody = inbuf[b ..< b + head.contentLen]
+      # The handler consumes the body through a string; this is the only body
+      # copy the request path has ever made and is unrelated to `inbuf`.
+      rawBody = newString(head.contentLen)
+      copyMem(addr rawBody[0], unsafeAddr data[b], head.contentLen)
     pos += totalLen
+    if countDirect:
+      inc recvDirectRequests
 
     var resp: ApiResponse
     try:
-      resp = handleRequest(database, secret, head.httpMethod, head.path,
+      resp = handleRequest(database, secret, data, head.httpMethod, head.path,
                            head.auth, rawBody)
     except Exception as ex:
       # Exception covers Defect as well (OverflowDefect, IndexDefect, ...): no
@@ -240,8 +292,22 @@ proc processRequests*(inbuf, outbuf: var string; keepAlive, closing: var bool;
       resp = ApiResponse(status: 500, body: """{"error":"internal server error"}""")
 
     keepAlive = head.keepAlive
+    ensureOutBuf()
     let respStart = outbuf.len
-    outbuf.addResponse(resp.status, resp.body, head.keepAlive)
+    if resp.feedDirect:
+      # GET /feed is the one response large enough to justify building its body
+      # in place. The writer appends the head and body atomically; if the
+      # database raises, roll the partial bytes back and emit the same 500 the
+      # generic path would.
+      try:
+        database.writeFeedResponse(outbuf, head.keepAlive)
+      except Exception as ex:
+        stderr.writeLine("feed writer error: " & ex.msg)
+        outbuf.setLen(respStart)
+        outbuf.addResponse(500, """{"error":"internal server error"}""",
+                           head.keepAlive)
+    else:
+      outbuf.addResponse(resp.status, resp.body, head.keepAlive)
     # Record responses produced while a group-commit batch is open: they must not
     # be sent until that batch commits, and become 500 if it fails to commit.
     if database != nil and database.batchOpen():
@@ -252,9 +318,25 @@ proc processRequests*(inbuf, outbuf: var string; keepAlive, closing: var bool;
       closing = true
       break
 
-  if pos > 0:
-    inbuf.delete(0 ..< pos)
+  consumed = pos
   true
+
+proc processRequests*(inbuf, outbuf: var string; keepAlive, closing: var bool;
+                      outOff: int; batchFrom, batchCount: var int;
+                      database: Db; secret: string;
+                      maxInBuf, maxOutBuf: int;
+                      outPool: ptr seq[string] = nil): bool =
+  ## Parse from a buffered request string (`Conn.inbuf`). The buffer is compacted
+  ## by exactly the consumed prefix; an incomplete tail stays for the next recv.
+  if inbuf.len == 0:
+    return true
+  var consumed = 0
+  result = processBuffer(inbuf.toOpenArray(0, inbuf.len - 1), outbuf,
+                         keepAlive, closing, outOff, batchFrom, batchCount,
+                         database, secret, maxInBuf, maxOutBuf, outPool,
+                         consumed, false)
+  if consumed > 0:
+    inbuf.delete(0 ..< consumed)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +351,14 @@ var SYS_io_uring_register {.importc, header: "<sys/syscall.h>".}: clong
 # only needed here.
 var SOCK_CLOEXEC  {.importc, header: "<sys/socket.h>".}: cint
 
+# eventfd: the multi-ring wake source (see runMultiLoop). EFD_NONBLOCK makes the
+# drain read (which clears the counter) never block; EFD_CLOEXEC is hygiene.
+proc c_eventfd(initval: cuint, flags: cint): cint
+  {.importc: "eventfd", header: "<sys/eventfd.h>".}
+const
+  EFD_NONBLOCK = 0x800
+  EFD_CLOEXEC  = 0x80000
+
 # ---------------------------------------------------------------------------
 # io_uring constants not already exported by iouring.nim (mirrored from
 # <linux/io_uring.h>)
@@ -280,6 +370,12 @@ const
   IORING_OP_ASYNC_CANCEL*  = 14'u8
 
   IORING_REGISTER_FILES_UPDATE* = 6
+  # Register one eventfd on a ring; the kernel bumps it on every completion
+  # event for that ring. One fd can be registered on every ring, so the N-ring
+  # waiter needs only a single epoll entry. (This only works when the ring does
+  # NOT use DEFER_TASKRUN: the signal happens when the CQ is committed, and
+  # deferred task work has not committed anything until someone enters.)
+  IORING_REGISTER_EVENTFD*      = 4
   IORING_ASYNC_CANCEL_USERDATA  = 1'u32 shl 4
 
   # user_data operation tags (low 8 bits) + slot (next 24) + generation (high 32)
@@ -289,18 +385,34 @@ const
   TAG_TIMEOUT* = 4'u64
   TAG_CANCEL*  = 5'u64
   TAG_PROVIDE* = 6'u64
+  TAG_CLOSE*   = 7'u64
 
   # ring / table sizing.
-  # The registered-file table size is RUNTIME (see `gSlots`): it is derived from
-  # the process fd ceiling at startup instead of a compile-time literal, so the
-  # server is no longer capped at 32768 connections. `IORING_REGISTER_FILES`
-  # counts every entry against RLIMIT_NOFILE, so the table size is
-  # `min(hardLimit - FdsReserve, CAP)`: `FdsReserve` reserves headroom for the
-  # process's own fds (stdio, the io_uring ring, the listener before it is
-  # closed, the sqlite db) - without it, registering 65536 entries fails when
-  # RLIMIT_NOFILE==65535. `SlotsFloor` is the smallest table we will register; if
-  # the kernel refuses the top size, startup steps DOWN to it instead of exiting.
+  # The registered-file table size is RUNTIME (see `RingCtx.slots`): it is
+  # derived from the process fd ceiling at startup instead of a compile-time
+  # literal, so a single ring is no longer capped at 32768 connections.
+  # `IORING_REGISTER_FILES` checks a table's size against RLIMIT_NOFILE (the
+  # check is per registration, not cumulative - verified on this kernel), so the
+  # per-ring size is `min(hardLimit - FdsReserve, MaxSlotsPerRing)`:
+  # `FdsReserve` reserves headroom for the process's own fds (stdio, the
+  # io_uring ring, the listener before it is closed, the sqlite db) - without it,
+  # registering 65536 entries fails when RLIMIT_NOFILE==65535.
+  #
+  # One request thread may own up to `MaxRings` rings after the fd / conntrack
+  # limits raise. Because every ring registers its own table, total
+  # capacity is rings * slotsPerRing (up to ~5 * 65535 = ~327k fixed slots), even
+  # though each individual registration stays under RLIMIT_NOFILE.
+  # `SlotsFloor` is the smallest table a ring registers; if the kernel refuses
+  # the top size, that ring steps DOWN to the floor instead of exiting.
   RingEntries  = 4096
+  MaxRings     = 5
+  MaxSlotsPerRing = 65535     # slot16 in user_data, and the registered cap
+  MaxConns     = MaxRings * MaxSlotsPerRing
+  # Conntrack entries reserved for everything that is not a served connection
+  # (the load generator's side of every socket, DNS, the odd tool). Auto-sizing
+  # targets `conntrack_max - ConntrackHeadroom`, so the current 64k cap yields
+  # target 64512 -> exactly one ring.
+  ConntrackHeadroom = 1024
   # Explicit CQ headroom, requested via IORING_SETUP_CQSIZE (see setupQueue).
   # Without CQSIZE the kernel defaults `cq_entries = 2 * sq_entries` (verified
   # on this host: sq=4096 -> cq=8192).  We ask for CqMultiple x so a burst of
@@ -309,7 +421,7 @@ const
   # conntrack ceiling: 4 * 4096 = 16384 CQEs against 4096 SQEs.  The kernel
   # fills the size it actually allocated into params.cq_entries and the startup
   # log prints it, so the headroom is observed, not assumed.  Submissions stay
-  # bounded by RingEntries: getSqe returns nil on a full SQ and mustSqe()
+  # bounded by RingEntries: getSqe returns nil on a full SQ and mustSqe(r)
   # flushes/waits.
   CqMultiple   = 4
   SlotsFloor   = 16384
@@ -329,6 +441,44 @@ const
   # staying far above the largest single response this API returns.
   MaxOutBuf     = 64 * 1024
   TickSeconds   = 1.0
+
+  # Load-adaptive completion wait (runLoop).  The loop always drains the whole
+  # CQ ring, so the blocking wait for one completion is already well batched.
+  # Under sustained load only, it instead waits for a small batch with a bounded
+  # timeout: existing CQEs count towards `min_complete`, so a backlog is never
+  # delayed, and the 100 us cap bounds how long a partial batch can wait.  A
+  # pass that drained fewer than `BatchMinComplete` completions falls straight
+  # back to the blocking single-completion wait, which also bounds the idle
+  # wakeup to the armed 1 s tick.
+  #
+  # A 16/150 us variant was considered and deliberately NOT taken: min_complete
+  # counts queued CQEs, so a pass that drained 8..15 would additionally sleep up
+  # to 150 us with that work already available. That is added latency, not just
+  # a longer idle wait, and without the requested 64k A/B it cannot be shown to
+  # be non-regressive. The 8/100 us point keeps the N>1 eventfd/epoll path
+  # (which does not use this batch wait at all) unchanged as well.
+  BatchMinComplete    = 8'u32
+  BatchMaxUsec        = 100'u64
+  BatchLoadThreshold  = 8
+
+  # -------------------------------------------------------------------------
+  # Output-buffer pool.
+  #
+  # An output buffer used to be kept for the whole life of a keep-alive
+  # connection (`outbuf.setLen(0)` after a drained SEND keeps the capacity of
+  # the largest response ever sent - ~5.1 KiB for /feed). At 5,000 idle
+  # connections that pinned ~25 MiB. Instead, a buffer is taken only while a
+  # response is being built and returned once the SEND has fully completed, so
+  # an idle connection holds a zero-capacity string. Retention is bounded on
+  # both axes: at most OutPoolCap buffers in the ring's pool and only buffers
+  # up to MaxRetainedOutCap bytes. Anything larger is freed immediately.
+  OutPoolCap        = 128
+  MaxRetainedOutCap = 64 * 1024
+  OutBufInitCap     = 8 * 1024
+  # Empty input buffers up to this capacity are kept (compacting a pipelined
+  # buffer is cheap and the connection is likely to read again soon); larger
+  # ones are freed once the consumed burst leaves nothing behind.
+  InBufRetainCap    = 4 * 1024
 
   # -------------------------------------------------------------------------
   # Provided-buffer pool ("the turbo").
@@ -358,6 +508,12 @@ const
   # it cannot lower RSS (page granularity) but would add a CQE per request.
   BufRingDefault = 64
   BufRingMax     = 8192
+  # Multi-ring default budget: the ring count is at most MaxRings, so splitting
+  # one bounded global budget keeps total provided buffers (~4,096 * 8 KiB of
+  # lazily-faulted address space) independent of how many rings exist. The
+  # single-ring default stays BufRingDefault (64), preserving the measured RSS /
+  # latency point; the multi-ring measurement compares the two budgets.
+  MultiBufBudget = 4096
 
 # kernel-side struct for IORING_OP_TIMEOUT
 type KernelTimespec {.bycopy.} = object
@@ -370,10 +526,10 @@ type KernelTimespec {.bycopy.} = object
 type
   ConnFlag = enum
     ## Per-connection boolean state. Kept in one `set` so the nine one-bit
-    ## facts occupy two bytes instead of nine bytes padded out to a full
-    ## machine word each time they land between the wider fields.
+    ## facts occupy two bytes instead of nine bytes padded out to full
+    ## machine words each time they land between the wider fields.
     cfActive, cfKeepAlive, cfClosing, cfReadPaused, cfRecvArmed, cfSendArmed,
-    cfWantFree, cfDeferred
+    cfWantFree, cfDeferred, cfRecvCancelPending
 
   Conn = object
     gen:        uint32   ## bumped per reuse so stale CQEs are ignored
@@ -391,7 +547,7 @@ type
 # expression and `c.active = false` stays an assignment. Each expands inline to
 # one bit test / incl / excl, so there is no call on the hot path. A pair is
 # provided for both a `Conn` value and a `ptr Conn`, matching the two ways the
-# connection is addressed (direct index and `addr conns[slot]`).
+# connection is addressed (direct index and `addr r.conns[slot]`).
 template active(c: Conn | ptr Conn): bool = cfActive in c.st
 template `active=`(c: var Conn | ptr Conn, v: bool) =
   (if v: c.st.incl cfActive else: c.st.excl cfActive)
@@ -411,6 +567,10 @@ template `readPaused=`(c: var Conn | ptr Conn, v: bool) =
 template recvArmed(c: Conn | ptr Conn): bool = cfRecvArmed in c.st
 template `recvArmed=`(c: var Conn | ptr Conn, v: bool) =
   (if v: c.st.incl cfRecvArmed else: c.st.excl cfRecvArmed)
+
+template recvCancelPending(c: Conn | ptr Conn): bool = cfRecvCancelPending in c.st
+template `recvCancelPending=`(c: var Conn | ptr Conn, v: bool) =
+  (if v: c.st.incl cfRecvCancelPending else: c.st.excl cfRecvCancelPending)
 
 template sendArmed(c: Conn | ptr Conn): bool = cfSendArmed in c.st
 template `sendArmed=`(c: var Conn | ptr Conn, v: bool) =
@@ -434,90 +594,228 @@ type
     gen:  uint32
 
 var
-  gRing:        Ring
-  gDb:          Db
-  gSecret:      string
-  gSlots:       int            # runtime registered-file table size (set in main)
-  conns:        seq[Conn]      # indexed by fixed-file slot, never resized
-  gFreeSlots:   seq[cint]
-  gFreeTop:     int
-  gGen:         uint32
-  gNow:         float
-  gLastCkpt:    float
-  gAcceptArmed: bool
-  gAcceptPaused: bool
+  # ---- shared by every ring (one request thread owns all of them) ------------
+  gDb:        Db
+  gSecret:    string
+  gNow:       float          # pass timestamp, refreshed once per completion pass
+  gZeroCopyStats: bool       # ZEROCOPY_STATS=1: log the recv fast-path counters
 
-  # ---- turbo toggles (env) -------------------------------------------------
-  # IOURING_RECV=multishot|oneshot (default multishot) and
-  # IOURING_ACCEPT=multishot|oneshot (default multishot). Both fall back at runtime
-  # if the kernel refuses the feature, and `-ENOBUFS`/`-EINVAL` are always
-  # handled, so a one-shot build is a single env var away if p99 regresses.
-  gRecvMultishot:   bool = true
-  gAcceptMultishot: bool = true
-  gAcceptMsProven:  bool = false
-  # Direct accept: install the accepted socket straight into a fixed slot with
-  # IORING_FILE_INDEX_ALLOC (kernel picks the slot; CQE res == slot). IOURING_ACCEPT_DIRECT=0
-  # forces the register-per-accept fallback; it also engages automatically if the
-  # kernel rejects the direct variant. Only meaningful with multishot accept.
-  gAcceptDirect:       bool = true
-  gAcceptDirectProven: bool = false
+type
+  RingCtx = object
+    ## Every piece of per-ring state. `gRings` holds 1..MaxRings instances; the
+    ## same request thread creates, enters and drains all of them (SINGLE_ISSUER
+    ## requires the creating task; DEFER_TASKRUN, N=1 only, additionally binds
+    ## task work to it). Procs receive a `var RingCtx`
+    ## (a reference in effect); a RingCtx is NEVER copied - its seq/ptr fields
+    ## would alias and copying `conns` alone would be a full table copy.
+    id:          uint8        # ring id carried in every CQE's user_data
+    ring:        Ring
+    listenerFd:  cint         # listener registered as fixed-file slot 0
+    slots:       int          # registered fixed-file entries in THIS ring
+                              # (includes slot 0 = this ring's listener)
+    multiRing:   bool         # driven by the shared epoll loop: never block one
+                              # ring's enter while another ring has work
 
-  # ---- provided-buffer pool ------------------------------------------------
-  gBufBase:     ptr UncheckedArray[char]   # gBufSlots * BufSize, lazily faulted
-  gBufRing:     ptr UncheckedArray[BufRingEntry]  # page-aligned descriptor ring
-  gBufTail:     uint16
-  gBufSlots:    int = BufRingDefault       # live pool size (IOURING_BUFS, power of 2)
-  gBufMask:     int = BufRingDefault - 1
-  gUseBufRing:  bool                       # true: registered PBUF_RING; else list
-  gBufsReady:   int                        # buffers handed to the kernel, not yet seen
-  gConsumedThisPass: int                   # data CQEs that returned a buffer this pass
-  gRecvStarved: seq[SlotRef]               # recv ended with -ENOBUFS (slot+gen)
-  gSendRetry:   seq[SlotRef]               # send ended with -ENOBUFS (slot+gen)
+    # ---- connection table and slot free list -------------------------------
+    conns:        seq[Conn]   # fixed-file slot index; capacity reserved for
+                              # `slots`, length grown only as slots are used
+    freeSlots:    seq[cint]
+    freeTop:      int
+    nextSlot:     int         # first never-used slot (high-water mark)
+    gen:          uint32      # per-ring generation, bumped on every accept
+    accepted:     uint64      # accepted connections (multi-ring fairness log)
+    ticks:        uint64      # 1 s ticks observed (multi-ring fairness log)
 
-  # Slots whose SEND was withheld because their responses were produced while a
-  # group-commit batch was open. Armed (or rewritten to 500) once the batch has
-  # been committed at the end of the completion-queue pass.
-  gDeferredSlots: seq[SlotRef]
+    # ---- accept state ------------------------------------------------------
+    acceptArmed:        bool
+    acceptPaused:       bool
+    # IOURING_RECV=multishot|oneshot (default multishot) and
+    # IOURING_ACCEPT=multishot|oneshot (default multishot). Multishot RECV has
+    # no runtime fallback: a kernel without IORING_RECV_MULTISHOT needs the
+    # manual IOURING_RECV=oneshot workaround (one-shot recv is re-armed after
+    # every CQE). Accept DOES fall back at runtime when the kernel refuses
+    # multishot/direct accept; `-ENOBUFS` is handled on the recv path.
+    recvMultishot:      bool = true
+    acceptMultishot:    bool = true
+    acceptMsProven:     bool = false
+    # Direct accept: install the accepted socket straight into a fixed slot with
+    # IORING_FILE_INDEX_ALLOC (kernel picks the slot; CQE res == slot).
+    # IOURING_ACCEPT_DIRECT=0 forces the register-per-accept fallback; it also
+    # engages automatically if the kernel rejects the direct variant.
+    acceptDirect:       bool = true
+    acceptDirectProven: bool = false
 
-  # accept scratch (must stay valid until the accept op completes)
-  gAcceptSa:    Sockaddr_in
-  gAcceptSaLen: SockLen
+    # ---- provided-buffer pool ---------------------------------------------
+    bufBase:      ptr UncheckedArray[char]          # bufSlots * BufSize, lazily faulted
+    bufRing:      ptr UncheckedArray[BufRingEntry]  # page-aligned descriptor ring
+    bufTail:      uint16
+    bufTailPending: bool                            # descriptors written, tail not published
+    bufSlots:     int = BufRingDefault              # live pool size (IOURING_BUFS, power of 2)
+    bufMask:      int = BufRingDefault - 1
+    useBufRing:   bool                              # true: registered PBUF_RING; else list
+    bufsReady:    int                               # buffers handed to the kernel, not yet seen
+    consumedThisPass: int                           # data CQEs that returned a buffer this pass
+    recvStarved:  seq[SlotRef]                      # recv ended with -ENOBUFS (slot+gen)
+    sendRetry:    seq[SlotRef]                      # send ended with -ENOBUFS (slot+gen)
 
-  # timeout scratch (must stay valid until the timeout op completes)
-  gTs:          KernelTimespec
+    # Slots whose SEND was withheld because their responses were produced while
+    # a group-commit batch was open. Armed (or rewritten to 500) once the batch
+    # has been committed at the end of the completion-queue pass.
+    deferredSlots: seq[SlotRef]
+
+    # Bounded per-ring pool of drained output buffers. The one request thread
+    # owns the ring (ARC), so no synchronisation is needed; an entry is always a
+    # zero-length string whose capacity is <= MaxRetainedOutCap.
+    outPool: seq[string]
+
+    # accept scratch (must stay valid until the accept op completes)
+    acceptSa:    Sockaddr_in
+    acceptSaLen: SockLen
+
+    # timeout scratch (must stay valid until the timeout op completes)
+    ts: KernelTimespec
+
+var
+  # 1..MaxRings rings, all owned by the single request thread. Exactly one
+  # element on the default (64k conntrack) configuration.
+  gRings: seq[RingCtx]
 
 # ---------------------------------------------------------------------------
 # user_data packing
 
-proc makeUd(tag: uint64, slot: cint, gen: uint32): uint64 {.inline.} =
-  tag or (uint64(uint32(slot)) shl 8) or (uint64(gen) shl 32)
+proc makeUd(tag: uint64, ring: uint8, slot: cint, gen: uint32): uint64 {.inline.} =
+  ## tag 8 | ring 8 | slot 16 | gen 32. A slot is a fixed-file index within ITS
+  ## ring's table, bounded by MaxSlotsPerRing (65,535); the generation
+  ## disambiguates reuse. Each CQE is routed to its ring by the ring id, and
+  ## dispatch() re-checks it so a mis-routed completion can never touch another
+  ## ring's slot table.
+  tag or (uint64(ring) shl 8) or
+    ((uint64(uint32(slot)) and 0xFFFF'u64) shl 16) or (uint64(gen) shl 32)
 
 proc udTag(ud: uint64): uint64 {.inline.} = ud and 0xFF'u64
-proc udSlot(ud: uint64): cint {.inline.} = cint((ud shr 8) and 0xFFFFFF'u64)
+proc udRing(ud: uint64): uint8 {.inline.} = uint8((ud shr 8) and 0xFF'u64)
+proc udSlot(ud: uint64): cint {.inline.} = cint((ud shr 16) and 0xFFFF'u64)
 proc udGen(ud: uint64): uint32 {.inline.} = uint32(ud shr 32)
+
+# ---------------------------------------------------------------------------
+# output-buffer pool
+#
+# `takeOutBuf` is called right before a response is appended; `releaseOutBuf`
+# only when the SEND that carried that response has completed in full (or when
+# `maybeFreeSlot` has proved `pending == 0`). The pool is deliberately tiny: it
+# removes per-request allocation for the common keep-alive reuse while keeping
+# the retained heap bounded no matter how many connections exist.
+
+proc takeOutBuf(pool: var seq[string]): string =
+  ## A zero-length buffer: a pooled one when available, else 8 KiB fresh.
+  if pool.len > 0:
+    result = pool.pop()
+    result.setLen(0)
+  else:
+    result = newStringOfCap(OutBufInitCap)
+
+proc releaseOutBuf(pool: var seq[string]; s: var string) =
+  ## Give `s` back to the pool when it is within both retention bounds, else
+  ## free it. The caller guarantees no in-flight SEND can still reference the
+  ## storage. `move` is required: copying a zero-length string loses its
+  ## capacity, which would defeat the pool entirely.
+  if s.capacity > 0 and s.capacity <= MaxRetainedOutCap and
+     pool.len < OutPoolCap:
+    s.setLen(0)
+    pool.add move(s)
+  else:
+    s = ""
+
+proc acquireOutBuf(buf: var string; pool: var seq[string]) =
+  ## `processRequests` hook: called only when a response is about to be
+  ## appended to an empty, zero-capacity buffer.
+  buf = takeOutBuf(pool)
+
+proc maybeReleaseOutBuf(r: var RingCtx; c: var Conn) {.inline.} =
+  ## Drop a live connection's output buffer once it is fully drained. Guarded so
+  ## it can never free storage a deferred/group-commit response, an armed SEND
+  ## or the unflushed tail of the current buffer still needs.
+  if c.batchCount == 0 and not c.deferred and not c.sendArmed and
+     c.outOff >= c.outbuf.len:
+    c.outOff = 0
+    releaseOutBuf(r.outPool, c.outbuf)
+
+proc releaseConnStorage(r: var RingCtx; c: var Conn) =
+  ## Return a dead connection's output buffer to the pool. Only `maybeFreeSlot`
+  ## calls this, and only after `pending == 0`, so no kernel SEND or RECV can
+  ## reference either buffer. The caller resets the whole `Conn` immediately
+  ## afterwards, which drops `inbuf`; retaining it here would be undone by that
+  ## reset, so only the pooled output buffer needs an explicit release.
+  releaseOutBuf(r.outPool, c.outbuf)
 
 # ---------------------------------------------------------------------------
 # HTTP/1.1 parsing and serialisation live in the shared `http` module (imported
 # above); this transport only supplies its inbound body cap (MaxInBuf) to
 # parseHead.
 
-proc processRequests(c: var Conn): bool {.inline.} =
+proc processRequests(r: var RingCtx; c: var Conn): bool {.inline.} =
   ## Thin adapter over the shared request loop above; maxOutBuf caps the
   ## buffered response bytes so a large pipelined burst drains across sends.
   ## keepAlive/closing are now bits in `c.st`, so they are staged through locals
   ## for the `var bool` core and written back; identical in/out semantics.
+  ## The core takes an output buffer from the pool only if it actually appends
+  ## a response; one that produced no bytes is returned immediately below.
   var ka = c.keepAlive
   var cl = c.closing
   result = processRequests(c.inbuf, c.outbuf, ka, cl, c.outOff,
                            c.batchFrom, c.batchCount, gDb, gSecret, MaxInBuf,
-                           MaxOutBuf)
+                           MaxOutBuf, addr r.outPool)
   c.keepAlive = ka
   c.closing = cl
+  # Consumed pipelined data leaves the request buffer empty; a large one is
+  # dropped instead of pinned for the life of the connection. A partial request
+  # still buffered is never touched.
+  if c.inbuf.len == 0 and c.inbuf.capacity > InBufRetainCap:
+    c.inbuf = ""
+  maybeReleaseOutBuf(r, c)
+
+proc processRecvDirect(r: var RingCtx; c: var Conn;
+                      data: openArray[char]): bool =
+  ## Parse one provided receive buffer in place. No request bytes enter
+  ## `Conn.inbuf`; only a trailing incomplete request (or the tail left by the
+  ## output cap) is copied out, so `data` can be returned to the kernel as soon
+  ## as this proc returns. Every response is fully appended to `c.outbuf` here,
+  ## and a deferred SEND references only that output buffer.
+  var ka = c.keepAlive
+  var cl = c.closing
+  var consumed = 0
+  result = processBuffer(data, c.outbuf, ka, cl, c.outOff,
+                         c.batchFrom, c.batchCount, gDb, gSecret, MaxInBuf,
+                         MaxOutBuf, addr r.outPool, consumed, true)
+  c.keepAlive = ka
+  c.closing = cl
+  if result and not c.closing and consumed < data.len:
+    let rem = data.len - consumed
+    c.inbuf.setLen(rem)
+    copyMem(addr c.inbuf[0], unsafeAddr data[consumed], rem)
+    inc recvCopiedBuffers
+  if c.inbuf.len == 0 and c.inbuf.capacity > InBufRetainCap:
+    c.inbuf = ""
+  maybeReleaseOutBuf(r, c)
+
+proc processRecv(r: var RingCtx; c: var Conn;
+                 data: openArray[char]): bool =
+  ## Route one receive buffer. With no carried partial the bytes are parsed in
+  ## place. When `c.inbuf` already holds an incomplete request the new bytes are
+  ## copied behind it, because the two buffers are not contiguous; that is the
+  ## only cross-buffer copy on the receive path.
+  if c.inbuf.len == 0:
+    return processRecvDirect(r, c, data)
+  let old = c.inbuf.len
+  c.inbuf.setLen(old + data.len)
+  copyMem(addr c.inbuf[old], unsafeAddr data[0], data.len)
+  inc recvCopiedBuffers
+  processRequests(r, c)
 
 # ---------------------------------------------------------------------------
 # fixed-file table bookkeeping
 
-proc updateSlotRaw(slot: cint, fd: cint): int =
+proc updateSlotRaw(r: var RingCtx; slot: cint, fd: cint): int =
   ## IORING_REGISTER_FILES_UPDATE: install `fd` (or -1 to clear) at `slot`.
   ## Passing -1 drops the table's reference, which closes the socket once any
   ## in-flight op holding its own reference completes.
@@ -525,7 +823,7 @@ proc updateSlotRaw(slot: cint, fd: cint): int =
   up[0] = uint64(uint32(slot))          # offset(u32) + resv(u32)
   var tmp = fd
   up[1] = uint64(cast[uint](addr tmp))  # pointer to the fd array
-  let ret = c_syscall(SYS_io_uring_register, clong(gRing.fd),
+  let ret = c_syscall(SYS_io_uring_register, clong(r.ring.fd),
                       clong(IORING_REGISTER_FILES_UPDATE),
                       clong(cast[uint](addr up[0])), clong(1))
   if ret < 0:
@@ -533,106 +831,198 @@ proc updateSlotRaw(slot: cint, fd: cint): int =
   else:
     result = int(ret)
 
-proc allocSlot(): cint =
-  if gFreeTop <= 0:
-    return -1
-  dec gFreeTop
-  gFreeSlots[gFreeTop]
+proc ensureSlot(r: var RingCtx; slot: cint) {.inline.} =
+  ## Materialise `r.conns` up to and including `slot`. The full fixed-file table
+  ## capacity was reserved once at startup with `newSeqOfCap`, so growing the
+  ## length here only zero-fills the newly committed payload: the allocation is
+  ## never reallocated and every `addr r.conns[i]` handed out earlier stays valid.
+  if int(slot) >= r.conns.len:
+    assert slot >= 0 and int(slot) < r.slots
+    r.conns.setLen(int(slot) + 1)
+    # Invaluable invariant: a setLen above the reserved capacity would realloc
+    # and silently invalidate live `ptr Conn`s held by in-flight completions.
+    assert r.conns.capacity >= r.slots
 
-proc releaseSlot(slot: cint) =
+proc allocSlot(r: var RingCtx): cint =
+  ## Pop a released slot first; otherwise commit the next never-used slot. The
+  ## slot's Conn is materialised by ensureSlot before the caller touches it.
+  if r.freeTop > 0:
+    dec r.freeTop
+    return r.freeSlots[r.freeTop]
+  if r.nextSlot >= r.slots:
+    return -1
+  result = cint(r.nextSlot)
+  inc r.nextSlot
+  ensureSlot(r, result)
+
+proc releaseSlot(r: var RingCtx; slot: cint) =
   ## Recv storage is pooled (not per-connection), so returning a slot is just
   ## bookkeeping: no buffer to free, only flags and the free-list push.
   ## In direct-accept mode the *kernel* owns slot allocation (FILES_UPDATE(-1) in
-  ## closeConn already frees the slot), so we must NOT also push it onto the
+  ## maybeFreeSlot already frees the slot), so we must NOT also push it onto the
   ## userspace free list - doing so would double-count and could overflow it.
-  conns[int(slot)].wantFree = false
-  if gAcceptDirect:
+  r.conns[int(slot)].wantFree = false
+  if r.acceptDirect:
     return
-  gFreeSlots[gFreeTop] = slot
-  inc gFreeTop
+  r.freeSlots[r.freeTop] = slot
+  inc r.freeTop
 
-proc rebuildFreeList() =
-  ## Rebuild the userspace free-slot list from the live connection table. Used
-  ## when a running ring downgrades from direct accept to the register-per-accept
-  ## path: the list was never consumed in direct mode, so it is stale and must
-  ## exclude every slot the kernel handed out directly.
-  gFreeTop = 0
-  for i in 1 ..< gSlots:
-    if not conns[i].active:
-      gFreeSlots[gFreeTop] = cint(i)
-      inc gFreeTop
+proc rebuildFreeList(r: var RingCtx) =
+  ## Used only when a ring downgrades from direct accept before any direct
+  ## accept has succeeded. The kernel therefore never installed a slot and the
+  ## userspace list was never consumed; keep the never-used range in nextSlot
+  ## and leave the free list empty.
+  r.freeTop = 0
+  r.nextSlot = r.conns.len
 
-proc maybeFreeSlot(slot: cint) =
+# Queued by maybeFreeSlot; defined with the other submission helpers below.
+proc submitClose(r: var RingCtx; slot: cint; gen: uint32): bool
+
+proc maybeFreeSlot(r: var RingCtx; slot: cint) =
+  ## Release a closed connection's slot once its last in-flight op has completed.
+  ## This is the ONLY place the socket's fixed-file entry is dropped and the
+  ## slot becomes reusable, so a new connection can never overwrite a slot while
+  ## a SEND still points at the old `outbuf`.
   if slot < 0:
     return
-  if not conns[int(slot)].active and conns[int(slot)].wantFree and
-     conns[int(slot)].pending == 0:
-    releaseSlot(slot)
+  var c = addr r.conns[int(slot)]
+  if c.active or not c.wantFree or c.pending != 0:
+    return
+  let gen = c.gen
+  # No op can reference this connection any more: release its pooled output
+  # buffer and reset the whole Conn BEFORE dropping the kernel's file reference.
+  # The reset drops `inbuf` (including any retained capacity), so a direct
+  # accept that immediately reuses this slot finds a clean Conn with no storage.
+  releaseConnStorage(r, c[])
+  r.conns[int(slot)] = Conn()
+  if r.acceptDirect:
+    # Direct descriptors are allocated and freed by the kernel. Closing via
+    # IORING_OP_CLOSE (fixed file_index) frees the slot in the kernel's bitmap
+    # as the op executes, so a direct accept cannot receive the slot before
+    # that point: no userspace free-list entry is involved. A failed close
+    # still posts an error CQE (success is skipped) and is recovered in
+    # onClose; if the SQE cannot be reserved at all, drop the entry with the
+    # register-update fallback so the slot is never leaked.
+    if not submitClose(r, slot, gen):
+      discard updateSlotRaw(r, slot, -1'i32)
+  else:
+    # Register-per-accept: the slot is userspace-owned and goes straight back
+    # on the free list below, so it must be dropped *now*; a deferred close op
+    # could otherwise close a freshly registered socket.
+    discard updateSlotRaw(r, slot, -1'i32)
+  releaseSlot(r, slot)
 
 # ---------------------------------------------------------------------------
 # submission helpers
 
-proc mustSqe(): ptr Sqe =
+proc flushBufTail(r: var RingCtx) {.inline.} =
+  ## Publish the provided-buffer producer tail after all descriptors pushed
+  ## during this pass. poolPush only writes descriptors and bumps bufTail; the
+  ## single tail store happens here, before the next enter can submit a recv.
+  if r.useBufRing and r.bufTailPending:
+    # Descriptor fields are visible before tail on x86 (stores are ordered) and
+    # the kernel loads the tail with acquire semantics.
+    r.bufRing[0].resv = r.bufTail
+    r.bufTailPending = false
+
+proc mustSqe(r: var RingCtx): ptr Sqe =
   ## Reserve an SQE, flushing (and, if needed, waiting for a completion) when
   ## the submission queue is momentarily full.
-  result = gRing.getSqe()
+  ##
+  ## In multi-ring mode the fallback wait is deliberately NOT used: the one
+  ## request thread must never block inside one ring's enter while another ring
+  ## already has completions waiting. A non-blocking submit() has always freed
+  ## the SQ on this kernel (the enter consumes every reserved SQE before it
+  ## returns), so the second getSqe is the only wait-free retry needed. The
+  ## final case is therefore unreachable in practice; it logs and skips the
+  ## arm rather than risking every other ring's completions behind this enter.
+  result = r.ring.getSqe()
   if result.isNil:
-    discard gRing.submit()
-    result = gRing.getSqe()
+    # The batch of buffer descriptors written so far must be published before
+    # this enter lets the kernel run the recvs armed earlier in the pass.
+    flushBufTail(r)
+    discard r.ring.submit()
+    result = r.ring.getSqe()
   if result.isNil:
-    discard gRing.submitAndWait(1)
-    result = gRing.getSqe()
+    if r.multiRing:
+      stderr.writeLine("io_uring ring " & $r.id & ": SQ full after submit; arm skipped")
+      return nil
+    flushBufTail(r)
+    discard r.ring.submitAndWait(1)
+    result = r.ring.getSqe()
+
+proc submitClose(r: var RingCtx; slot: cint; gen: uint32): bool =
+  ## Queue IORING_OP_CLOSE for a direct (fixed) descriptor and skip its success
+  ## CQE. The kernel clears the slot's bitmap as the op executes, so a direct
+  ## accept cannot hand the slot out before the close has run; the userspace
+  ## Conn was already reset and pending was zero. A close failure still posts a
+  ## CQE (IOSQE_CQE_SKIP_SUCCESS skips only success) and is recovered by onClose.
+  let sqe = mustSqe(r)
+  if sqe.isNil:
+    return false
+  sqe.opcode = IORING_OP_CLOSE
+  # `file_index` (the splice_fd_in union) selects a fixed descriptor; 0 would
+  # mean a process fd, hence slot + 1. IOSQE_FIXED_FILE is deliberately NOT
+  # set: the kernel rejects a close sqe that uses it.
+  sqe.fd = 0'i32
+  sqe.splice_fd_in = int32(slot + 1)
+  sqe.flags = IOSQE_CQE_SKIP_SUCCESS
+  sqe.user_data = makeUd(TAG_CLOSE, r.id, slot, gen)
+  true
 
 # ---------------------------------------------------------------------------
 # provided-buffer pool
 #
-# Buffer `bid` always lives at `gBufBase[bid * BufSize]`; the id is the index,
+# Buffer `bid` always lives at `r.bufBase[bid * BufSize]`; the id is the index,
 # so a returned buffer is simply re-published with that same id and no
 # allocation bookkeeping is needed at all on the hot path.
 
-proc poolPush(bid: int) =
+proc poolPush(r: var RingCtx; bid: int) =
   ## Hand buffer `bid` back to the kernel. With a registered buf ring this is
-  ## pure userspace bookkeeping (write the descriptor, publish `tail`); the
-  ## fallback submits one IORING_OP_PROVIDE_BUFFERS per buffer.
-  if gUseBufRing:
-    let idx = int(gBufTail) and gBufMask
-    let e = addr gBufRing[idx]
-    e.`addr` = cast[uint64](addr gBufBase[bid * BufSize])
+  ## pure userspace bookkeeping (write the descriptor, bump the producer tail);
+  ## flushBufTail publishes the tail once per pass. The fallback submits one
+  ## fire-and-forget IORING_OP_PROVIDE_BUFFERS per buffer (success CQE skipped;
+  ## an error CQE is handled in dispatch).
+  if r.useBufRing:
+    let idx = int(r.bufTail) and r.bufMask
+    let e = addr r.bufRing[idx]
+    e.`addr` = cast[uint64](addr r.bufBase[bid * BufSize])
     e.len = uint32(BufSize)
     e.bid = uint16(bid)
-    # Publish the producer tail only after the descriptor fields; the kernel
-    # loads `tail` with acquire semantics, and on x86 stores are ordered.
-    gBufTail = gBufTail + 1'u16
-    gBufRing[0].resv = gBufTail
+    r.bufTail = r.bufTail + 1'u16
+    r.bufTailPending = true
   else:
-    let sqe = mustSqe()
+    let sqe = mustSqe(r)
     if sqe.isNil:
       return
-    prepProvideBuffers(sqe, cast[uint64](addr gBufBase[bid * BufSize]),
+    prepProvideBuffers(sqe, cast[uint64](addr r.bufBase[bid * BufSize]),
                        uint32(BufSize), 1'u32, uint16(bid), BufGroup)
-    sqe.user_data = TAG_PROVIDE
-  inc gBufsReady
+    sqe.flags = IOSQE_CQE_SKIP_SUCCESS
+    # gen=1 marks a single-buffer provide (gen=0 is the bulk init provide), so a
+    # failed provide can undo exactly one bufsReady count.
+    sqe.user_data = makeUd(TAG_PROVIDE, r.id, 0, 1)
+  inc r.bufsReady
 
-proc poolConsume() {.inline.} =
-  dec gBufsReady
-  inc gConsumedThisPass
+proc poolConsume(r: var RingCtx) {.inline.} =
+  dec r.bufsReady
+  inc r.consumedThisPass
 
-proc armAccept() =
+proc armAccept(r: var RingCtx) =
   ## Arm accept. With IORING_ACCEPT_MULTISHOT one SQE serves every pending
   ## connection until the kernel reports it can no longer continue
   ## (IORING_CQE_F_MORE clears); otherwise it is re-armed per completion.
-  if gAcceptArmed:
+  if r.acceptArmed:
     return
-  let sqe = mustSqe()
+  let sqe = mustSqe(r)
   if sqe.isNil:
     return
-  gAcceptSaLen = SockLen(sizeof(gAcceptSa))
+  r.acceptSaLen = SockLen(sizeof(r.acceptSa))
   sqe.opcode = IORING_OP_ACCEPT
   sqe.flags = IOSQE_FIXED_FILE
   sqe.fd = ListenSlot
-  sqe.`addr` = cast[uint64](addr gAcceptSa)
-  sqe.off = cast[uint64](addr gAcceptSaLen)
-  if gAcceptDirect and gAcceptMultishot:
+  sqe.`addr` = cast[uint64](addr r.acceptSa)
+  sqe.off = cast[uint64](addr r.acceptSaLen)
+  if r.acceptDirect and r.acceptMultishot:
     # Direct descriptor: the kernel installs the accepted socket into the first
     # free registered-file slot and returns that SLOT in the CQE's `res` (field
     # is the splice_fd_in/file_index union at Sqe offset 44). SOCK_CLOEXEC is
@@ -642,22 +1032,27 @@ proc armAccept() =
     sqe.splice_fd_in = cast[int32](IORING_FILE_INDEX_ALLOC)
   else:
     sqe.rw_flags = uint32(SOCK_NONBLOCK or SOCK_CLOEXEC)
-  if gAcceptMultishot:
+  if r.acceptMultishot:
     sqe.ioprio = uint16(IORING_ACCEPT_MULTISHOT)
-  sqe.user_data = makeUd(TAG_ACCEPT, 0, 0)
-  gAcceptArmed = true
+  sqe.user_data = makeUd(TAG_ACCEPT, r.id, 0, 0)
+  r.acceptArmed = true
 
-proc armRecv(slot: cint) =
+proc armRecv(r: var RingCtx; slot: cint) =
   ## Arm (or, in multishot mode, leave armed) a recv that selects its landing
   ## buffer from the shared provided-buffer pool. `IOSQE_BUFFER_SELECT` makes
   ## the kernel pick a buffer; the CQE then carries its id in the high 16 bits
   ## of cqe->flags.
+  ##
+  ## `recvArmed` is held until the recv's terminal CQE, and a pending CANCEL is
+  ## serialized in front of any new recv: until that CANCEL's terminal arrives
+  ## the old op still owns the user_data it shares with the slot, so arming a
+  ## second multishot recv here would alias two kernel ops onto one cancel.
   if slot < 0:
     return
-  var c = addr conns[int(slot)]
-  if not c.active or c.closing or c.recvArmed:
+  var c = addr r.conns[int(slot)]
+  if not c.active or c.closing or c.recvArmed or c.recvCancelPending:
     return
-  let sqe = mustSqe()
+  let sqe = mustSqe(r)
   if sqe.isNil:
     return
   sqe.opcode = IORING_OP_RECV
@@ -665,39 +1060,39 @@ proc armRecv(slot: cint) =
   sqe.fd = slot
   sqe.buf_index = BufGroup
   sqe.len = uint32(BufSize)
-  if gRecvMultishot:
+  if r.recvMultishot:
     sqe.ioprio = uint16(IORING_RECV_MULTISHOT)
-  sqe.user_data = makeUd(TAG_RECV, slot, c.gen)
+  sqe.user_data = makeUd(TAG_RECV, r.id, slot, c.gen)
   c.recvArmed = true
   inc c.pending
 
-proc rearmStarved() =
+proc rearmStarved(r: var RingCtx) =
   ## Re-arm every recv that ended with -ENOBUFS, now that buffers have returned.
-  ## Only called when at least one buffer is available (gBufsReady > 0), so it
+  ## Only called when at least one buffer is available (r.bufsReady > 0), so it
   ## cannot spin on a still-empty pool.
-  if gRecvStarved.len == 0:
+  if r.recvStarved.len == 0:
     return
-  let starved = gRecvStarved
-  gRecvStarved.setLen(0)
+  let starved = r.recvStarved
+  r.recvStarved.setLen(0)
   for sr in starved:
     let slot = sr.slot
-    if slot < 0 or int(slot) >= conns.len:
+    if slot < 0 or int(slot) >= r.conns.len:
       continue
-    var c = addr conns[int(slot)]
+    var c = addr r.conns[int(slot)]
     if c.gen != sr.gen:
       continue                      # slot reused by another connection: stale
     if c.active and not c.closing and not c.recvArmed and not c.readPaused:
-      armRecv(slot)
+      armRecv(r, slot)
 
-proc armSend(slot: cint) =
+proc armSend(r: var RingCtx; slot: cint) =
   if slot < 0:
     return
-  var c = addr conns[int(slot)]
+  var c = addr r.conns[int(slot)]
   if not c.active or c.sendArmed:
     return
   if c.outOff >= c.outbuf.len:
     return
-  let sqe = mustSqe()
+  let sqe = mustSqe(r)
   if sqe.isNil:
     return
   sqe.opcode = IORING_OP_SEND
@@ -706,17 +1101,17 @@ proc armSend(slot: cint) =
   sqe.`addr` = cast[uint64](addr c.outbuf[c.outOff])
   sqe.len = uint32(c.outbuf.len - c.outOff)
   sqe.rw_flags = uint32(MSG_NOSIGNAL)
-  sqe.user_data = makeUd(TAG_SEND, slot, c.gen)
+  sqe.user_data = makeUd(TAG_SEND, r.id, slot, c.gen)
   c.sendArmed = true
   inc c.pending
 
-proc armSendOrDefer(slot: cint) =
+proc armSendOrDefer(r: var RingCtx; slot: cint) =
   ## Arm a SEND for freshly produced output, unless that output was produced
   ## while a group-commit batch is open: then the response must wait for COMMIT,
   ## so remember the slot and let `flushDeferredSlots` arm the send afterwards.
   if slot < 0:
     return
-  var c = addr conns[int(slot)]
+  var c = addr r.conns[int(slot)]
   if not c.active or c.sendArmed:
     return
   if c.outOff >= c.outbuf.len:
@@ -724,263 +1119,318 @@ proc armSendOrDefer(slot: cint) =
   if gDb != nil and gDb.batchOpen() and c.batchCount > 0:
     if not c.deferred:
       c.deferred = true
-      gDeferredSlots.add (slot: slot, gen: c.gen)
+      r.deferredSlots.add (slot: slot, gen: c.gen)
     return
-  armSend(slot)
+  armSend(r, slot)
 
-proc cancelOp(slot: cint, tag: uint64, gen: uint32) =
+proc cancelOp(r: var RingCtx; slot: cint, tag: uint64, gen: uint32): bool =
   ## Cancel an in-flight op by its user_data so the socket's last reference can
-  ## be dropped and the fixed slot reused.
-  let sqe = mustSqe()
+  ## be dropped and the fixed slot reused. Returns false when the SQE could not
+  ## be reserved; `disarmRecv` then leaves the op armed so a later disarm or
+  ## close can retry the cancel.
+  let sqe = mustSqe(r)
   if sqe.isNil:
-    return
+    return false
   sqe.opcode = IORING_OP_ASYNC_CANCEL
-  sqe.`addr` = makeUd(tag, slot, gen)
+  sqe.`addr` = makeUd(tag, r.id, slot, gen)
   sqe.rw_flags = IORING_ASYNC_CANCEL_USERDATA
-  sqe.user_data = TAG_CANCEL
+  sqe.flags = IOSQE_CQE_SKIP_SUCCESS   # fire-and-forget: the target's CQE retires it
+  sqe.user_data = makeUd(TAG_CANCEL, r.id, 0, 0)
+  return true
 
-proc disarmRecv(slot: cint) =
+proc disarmRecv(r: var RingCtx; slot: cint) =
   ## Stop a still-armed (multishot) recv so it cannot keep delivering data after
-  ## the connection paused reading or decided to close. The op stays counted in
-  ## `pending` until its -ECANCELED completion arrives.
-  if slot < 0 or int(slot) >= conns.len:
+  ## the connection paused reading or decided to close. `recvArmed` stays set and
+  ## `recvCancelPending` is raised until the recv op's terminal CQE arrives
+  ## (`!more`; `-ECANCELED` when the cancel hits). Only then may `armRecv`
+  ## submit the next recv. Both ops would otherwise share the slot's user_data
+  ## and one `closeConn` cancel could leave the other multishot recv holding the
+  ## fixed-file reference. The op stays counted in `pending` until that terminal
+  ## completion.
+  if slot < 0 or int(slot) >= r.conns.len:
     return
-  var c = addr conns[int(slot)]
-  if c.recvArmed:
-    c.recvArmed = false
-    cancelOp(slot, TAG_RECV, c.gen)
+  var c = addr r.conns[int(slot)]
+  if c.recvArmed and not c.recvCancelPending:
+    if cancelOp(r, slot, TAG_RECV, c.gen):
+      c.recvCancelPending = true
 
-proc armTimeout() =
-  let sqe = mustSqe()
+proc armTimeout(r: var RingCtx) =
+  let sqe = mustSqe(r)
   if sqe.isNil:
     return
-  gTs.tv_sec = int64(TickSeconds)
-  gTs.tv_nsec = 0
+  r.ts.tv_sec = int64(TickSeconds)
+  r.ts.tv_nsec = 0
   sqe.opcode = IORING_OP_TIMEOUT
   sqe.fd = -1'i32
-  sqe.`addr` = cast[uint64](addr gTs)
+  sqe.`addr` = cast[uint64](addr r.ts)
   sqe.len = 1'u32
   sqe.off = 0
-  sqe.user_data = TAG_TIMEOUT
+  sqe.user_data = makeUd(TAG_TIMEOUT, r.id, 0, 0)
 
 # ---------------------------------------------------------------------------
 # connection lifecycle
 
-proc closeConn(slot: cint) =
-  if slot < 0 or int(slot) >= conns.len:
+proc closeConn(r: var RingCtx; slot: cint) =
+  if slot < 0 or int(slot) >= r.conns.len:
     return
-  var c = addr conns[int(slot)]
+  var c = addr r.conns[int(slot)]
   if not c.active:
     return
   let gen = c.gen
-  if c.recvArmed:
-    cancelOp(slot, TAG_RECV, gen)
+  # Mark the connection dead but KEEP gen, pending, inbuf and outbuf: a SEND
+  # cancelled below is only queued for cancellation, so the kernel may still
+  # dereference `addr c.outbuf[c.outOff]` until its completion arrives. Keep the
+  # slot off the free list (wantFree) until pending hits zero; maybeFreeSlot
+  # then resets the Conn and drops the fixed-file entry in one place.
+  c.active = false
+  c.closing = true
+  c.wantFree = true
+  # A recv cancel may already be in flight from `disarmRecv`; the pending flag
+  # makes this a single cancel for the slot. `recvArmed` stays set until that
+  # CANCEL's terminal CQE, so pending cannot be left with an untracked op.
+  if c.recvArmed and not c.recvCancelPending:
+    if cancelOp(r, slot, TAG_RECV, gen):
+      c.recvCancelPending = true
   if c.sendArmed:
-    cancelOp(slot, TAG_SEND, gen)
-  # Drop the table's reference; the socket closes once in-flight ops finish.
-  discard updateSlotRaw(slot, -1'i32)
-  # Reset the slot (releasing the buffers via ARC) but KEEP `gen` and `pending`:
-  # the ops cancelled above still complete and must (a) look current so they
-  # decrement `pending`, and (b) keep the slot off the free list until they do.
-  # wantFree arms that release once `pending` hits zero.
-  let pend = c.pending
-  conns[int(slot)] = Conn(gen: gen, pending: pend, st: {cfWantFree})
-  maybeFreeSlot(slot)
+    discard cancelOp(r, slot, TAG_SEND, gen)
+  maybeFreeSlot(r, slot)
 
-proc finalizeConn(slot: cint) =
+proc finalizeConn(r: var RingCtx; slot: cint) =
   if slot < 0:
     return
-  var c = addr conns[int(slot)]
+  var c = addr r.conns[int(slot)]
   if not c.active:
     return
   if c.closing and not c.sendArmed and c.outOff >= c.outbuf.len:
-    closeConn(slot)
+    closeConn(r, slot)
 
 # ---------------------------------------------------------------------------
 # completion handlers
 
-proc initAcceptedSlot(slot: cint) =
+proc initAcceptedSlot(r: var RingCtx; slot: cint) =
   ## Bring a freshly acquired fixed-file slot into service.  Recv storage is
-  ## pooled, so there is nothing per-connection to allocate here.
-  inc gGen
-  conns[int(slot)] = Conn(gen: gGen, st: {cfActive, cfKeepAlive},
+  ## pooled, so there is nothing per-connection to allocate here; the slot's
+  ## Conn may still be above the committed length (direct accept), so
+  ## materialise it first.
+  ensureSlot(r, slot)
+  inc r.gen
+  r.conns[int(slot)] = Conn(gen: r.gen, st: {cfActive, cfKeepAlive},
                           lastActive: gNow)
 
-proc onAccept(res: cint, more: bool) =
+proc onAccept(r: var RingCtx; res: cint, more: bool) =
   ## `more` mirrors IORING_CQE_F_MORE: while set, a multishot accept is still
   ## armed and must NOT be re-submitted.  On success `res` is either an OS fd
   ## (register-per-accept path) or a fixed-file SLOT index (direct path).
   if not more:
-    gAcceptArmed = false
+    r.acceptArmed = false
   if res >= 0:
     var slot: cint
-    if gAcceptDirect:
+    if r.acceptDirect:
       # Direct accept: the kernel already installed the socket into a free
-      # fixed-file slot, and `res` IS that slot. No allocSlot(), no
-      # FILES_UPDATE, no per-accept fd to close.
+      # fixed-file slot, and `res` IS that slot. No allocSlot(r), no
+      # FILES_UPDATE, no per-accept fd to close. The slot can be beyond the
+      # current `r.conns` length, so validate against the TABLE size and commit
+      # the slot before reading its Conn.
       slot = cint(res)
-      if slot <= 0 or int(slot) >= conns.len or conns[int(slot)].active:
+      if slot <= 0 or int(slot) >= r.slots:
         stderr.writeLine("io_uring: direct accept returned unusable slot " & $slot)
-        if slot > 0 and int(slot) < conns.len:
-          discard updateSlotRaw(slot, -1'i32)   # drop the kernel-installed file
         if not more:
-          armAccept()
+          armAccept(r)
         return
-      gAcceptDirectProven = true
+      ensureSlot(r, slot)
+      if r.conns[int(slot)].active:
+        stderr.writeLine("io_uring: direct accept returned unusable slot " & $slot)
+        discard updateSlotRaw(r, slot, -1'i32)   # drop the kernel-installed file
+        if not more:
+          armAccept(r)
+        return
+      r.acceptDirectProven = true
     else:
-      slot = allocSlot()
+      slot = allocSlot(r)
       if slot < 0:
         discard posix.close(res)
-        gAcceptPaused = true          # retry on the next tick
+        r.acceptPaused = true          # retry on the next tick
         return
-      if updateSlotRaw(slot, res) < 0:
+      if updateSlotRaw(r, slot, res) < 0:
         stderr.writeLine("io_uring: register update failed; dropping accept")
         discard posix.close(res)
-        gFreeSlots[gFreeTop] = slot; inc gFreeTop
+        r.freeSlots[r.freeTop] = slot; inc r.freeTop
         if not more:
-          armAccept()
+          armAccept(r)
         return
       # Registered: the fixed table now holds its own reference, so release the
       # process fd immediately (this is the RLIMIT_NOFILE bypass).
       applyTcpTuning(res)
       discard posix.close(res)
 
-    gAcceptMsProven = true
-    initAcceptedSlot(slot)
-    armRecv(slot)
+    r.acceptMsProven = true
+    inc r.accepted
+    initAcceptedSlot(r, slot)
+    armRecv(r, slot)
     if not more:
-      armAccept()
+      armAccept(r)
   else:
     if res == -EAGAIN or res == -EINTR:
-      armAccept()
+      armAccept(r)
     elif res == -EINVAL or res == -EOPNOTSUPP:
-      if gAcceptDirect and gAcceptMultishot and not gAcceptDirectProven:
+      if r.acceptDirect and r.acceptMultishot and not r.acceptDirectProven:
         # Kernel refuses IORING_FILE_INDEX_ALLOC direct accept: keep multishot
         # but go back to registering each accepted fd into a free slot.
-        gAcceptDirect = false
-        rebuildFreeList()
+        r.acceptDirect = false
+        rebuildFreeList(r)
         stderr.writeLine("io_uring: direct accept (FILE_INDEX_ALLOC) unsupported (" &
                          $res & "); falling back to register-per-accept")
-        armAccept()
-      elif gAcceptMultishot and not gAcceptMsProven:
+        armAccept(r)
+      elif r.acceptMultishot and not r.acceptMsProven:
         # Kernel refuses IORING_ACCEPT_MULTISHOT: degrade to a re-armed one-shot
         # accept. This is the only way to detect it (accept flags are not
         # covered by IORING_REGISTER_PROBE).
-        gAcceptMultishot = false
-        gAcceptDirect = false
+        r.acceptMultishot = false
+        r.acceptDirect = false
         stderr.writeLine("io_uring: multishot accept unsupported (" & $res &
                          "); falling back to re-armed accept")
-        armAccept()
+        armAccept(r)
       else:
-        gAcceptPaused = true
+        r.acceptPaused = true
     elif res == -ECANCELED:
       discard
     else:
       # EMFILE/ENFILE/ECONNABORTED/... : back off; the tick revives the accept.
-      gAcceptPaused = true
+      r.acceptPaused = true
 
-proc onRecv(slot: cint, gen: uint32, res: cint, cflags: uint32) =
+proc onRecv(r: var RingCtx; slot: cint, gen: uint32, res: cint, cflags: uint32) =
   ## One recv completion. In multishot mode the same SQE yields many of these
   ## (each with IORING_CQE_F_MORE); only the terminal one clears `pending`. In
   ## both modes the data lives in a provided buffer whose id is in the high 16
   ## bits of `cflags`, and which is returned to the pool before we leave.
-  if slot < 0 or int(slot) >= conns.len:
+  if slot < 0 or int(slot) >= r.conns.len:
     return
   let hasBuf = (cflags and IORING_CQE_F_BUFFER) != 0'u32
   let more   = (cflags and IORING_CQE_F_MORE) != 0'u32
   var bid = -1
   if hasBuf:
     bid = int((cflags shr uint32(IORING_CQE_BUFFER_SHIFT)) and 0xFFFF'u32)
-    poolConsume()
+    poolConsume(r)
 
-  if conns[int(slot)].gen != gen:
+  if r.conns[int(slot)].gen != gen:
     # Stale completion for a reused slot: only the buffer needs returning.
-    if bid >= 0: poolPush(bid)
+    if bid >= 0: poolPush(r, bid)
     return
 
-  var c = addr conns[int(slot)]
+  var c = addr r.conns[int(slot)]
   if not more:
-    # Terminal completion: this recv op is no longer armed.
+    # Terminal completion: this recv op is no longer armed and any CANCEL that
+    # was serialized in front of a new arm has now reached its terminal state.
     c.recvArmed = false
+    c.recvCancelPending = false
     dec c.pending
 
   if not c.active:
-    if bid >= 0: poolPush(bid)
-    maybeFreeSlot(slot)
+    if bid >= 0: poolPush(r, bid)
+    maybeFreeSlot(r, slot)
     return
   c.lastActive = gNow
 
   if res > 0:
     if c.closing:
-      if bid >= 0: poolPush(bid)      # discard data for a closing conn
+      if bid >= 0: poolPush(r, bid)      # discard data for a closing conn
       return
     let n = int(res)
-    let old = c.inbuf.len
-    c.inbuf.setLen(old + n)
-    if bid >= 0:
-      copyMem(addr c.inbuf[old], addr gBufBase[bid * BufSize], n)
-      poolPush(bid)
-    # Stop reading (do not close) once the buffer passes the request cap so a
-    # pipelined burst drains; only a lone oversized request/header is rejected.
+    if bid < 0:
+      # IOSQE_BUFFER_SELECT always reports a buffer for data. If it did not,
+      # the bytes have no readable source; close instead of pretending.
+      c.closing = true
+    elif not c.sendArmed:
+      # Parse and serve straight from the provided buffer, then return it. The
+      # parser borrows only this call's data and every response is already
+      # appended to `outbuf`, so nothing outlives the poolPush below.
+      let base = cast[ptr UncheckedArray[char]](addr r.bufBase[bid * BufSize])
+      let ok = processRecv(r, c[], toOpenArray(base, 0, n - 1))
+      poolPush(r, bid)
+      if not ok:
+        c.closing = true
+    else:
+      # A SEND is in flight. Touching `outbuf` now could move storage under the
+      # kernel's SQE, so carry these bytes in `inbuf` and let onSend parse them
+      # once the buffer is drained.
+      let old = c.inbuf.len
+      c.inbuf.setLen(old + n)
+      copyMem(addr c.inbuf[old], addr r.bufBase[bid * BufSize], n)
+      inc recvCopiedBuffers
+      poolPush(r, bid)
+    # Stop reading (do not close) once the buffered remainder passes the request
+    # cap so a pipelined burst drains; only a lone oversized request/header is
+    # rejected.
     if c.inbuf.len > MaxRequest:
       if findHeaderEnd(c.inbuf) >= 0:
         c.readPaused = true
       else:
         c.closing = true
-    if not c.closing and not c.sendArmed:
-      if not processRequests(c[]):
-        c.closing = true
+    if not c.sendArmed:
       if c.inbuf.len <= MaxRequest:
         c.readPaused = false
       # Defer the SEND when this pass opened a write batch (see armSendOrDefer).
-      armSendOrDefer(slot)
+      # This must also run for a closing connection: a `Connection: close`
+      # request, a malformed request (400) or a partial request followed by EOF
+      # still has output that must be flushed before the close.
+      armSendOrDefer(r, slot)
     if not c.closing and not c.readPaused:
-      armRecv(slot)          # no-op while a multishot op is still armed
+      armRecv(r, slot)          # no-op while a multishot op is still armed
     elif c.recvArmed:
-      disarmRecv(slot)
-    finalizeConn(slot)
+      disarmRecv(r, slot)
+    finalizeConn(r, slot)
     return
 
   # Non-data completion.
-  if bid >= 0: poolPush(bid)
+  if bid >= 0: poolPush(r, bid)
   if res == 0:
     # Peer closed its write side: flush what we have, then close. Defer the send
     # if this pass opened a write batch, so the response still waits for COMMIT.
     c.closing = true
     if not c.sendArmed:
-      armSendOrDefer(slot)
-    finalizeConn(slot)
+      armSendOrDefer(r, slot)
+    finalizeConn(r, slot)
     return
   # res < 0
   if res == -ENOBUFS:
     # The pool is momentarily empty. If a buffer is already available, re-arm
     # now; otherwise remember the slot and re-arm once buffers return (end of
     # pass / tick), which prevents a submit-and-immediately-ENOBUFS spin.
-    if gBufsReady > 0:
-      armRecv(slot)
+    if r.bufsReady > 0:
+      armRecv(r, slot)
     else:
-      gRecvStarved.add (slot: slot, gen: c.gen)
+      r.recvStarved.add (slot: slot, gen: c.gen)
     return
   if res == -EAGAIN or res == -EINTR:
-    armRecv(slot)
+    armRecv(r, slot)
     return
   if res == -ECANCELED or res == -ENOENT:
+    # -ECANCELED is the serialized recv CANCEL's terminal; the `!more` branch
+    # above has already cleared recvArmed/recvCancelPending and decremented
+    # pending. A cancel MISS is reported as -ENOENT on the TAG_CANCEL
+    # completion, and TAG_CANCEL is discarded in dispatch, so -ENOENT on the
+    # recv itself is defensive rather than the miss signal. In both cases resume
+    # reading only for a live, non-closing connection that is not paused; a
+    # paused connection is re-armed by the resume path (onSend) once readPaused
+    # clears.
+    if c.active and not c.closing and not c.readPaused:
+      armRecv(r, slot)
     return
   c.closing = true
   if not c.sendArmed:
-    armSendOrDefer(slot)   # wait for COMMIT if a write batch is open
-  finalizeConn(slot)
+    armSendOrDefer(r, slot)   # wait for COMMIT if a write batch is open
+  finalizeConn(r, slot)
 
-proc onSend(slot: cint, gen: uint32, res: cint) =
-  if slot < 0 or int(slot) >= conns.len:
+proc onSend(r: var RingCtx; slot: cint, gen: uint32, res: cint) =
+  if slot < 0 or int(slot) >= r.conns.len:
     return
-  if conns[int(slot)].gen != gen:
+  if r.conns[int(slot)].gen != gen:
     return
-  dec conns[int(slot)].pending
-  if not conns[int(slot)].active:
-    maybeFreeSlot(slot)
+  dec r.conns[int(slot)].pending
+  if not r.conns[int(slot)].active:
+    maybeFreeSlot(r, slot)
     return
-  var c = addr conns[int(slot)]
+  var c = addr r.conns[int(slot)]
   c.sendArmed = false
   c.lastActive = gNow
 
@@ -988,102 +1438,161 @@ proc onSend(slot: cint, gen: uint32, res: cint) =
     c.outOff += int(res)
   else:
     if res == -EAGAIN:
-      armSend(slot)
+      armSend(r, slot)
       return
     if res == -ENOBUFS:
       # Transient kernel allocation failure: retry on the next tick rather than
       # spin, so the response is recovered instead of the connection dropped.
       c.sendArmed = false
-      gSendRetry.add (slot: slot, gen: c.gen)
+      r.sendRetry.add (slot: slot, gen: c.gen)
       return
     if res == -ECANCELED or res == -ENOENT:
       return
-    closeConn(slot)
+    closeConn(r, slot)
     return
 
   if c.outOff >= c.outbuf.len:
-    c.outbuf.setLen(0)
-    c.outOff = 0
     # Answer any request that arrived while the previous response was in flight.
+    # `processRequests` may append to (and reuse) the buffer already owned here,
+    # so the buffer is only dropped after that.
     if not c.closing and c.inbuf.len > 0:
-      if not processRequests(c[]):
+      if not processRequests(r, c[]):
         c.closing = true
       if c.inbuf.len <= MaxRequest:
         c.readPaused = false
       # Defer the SEND when this pass opened a write batch (see armSendOrDefer).
-      armSendOrDefer(slot)
+      armSendOrDefer(r, slot)
     if c.closing and not c.sendArmed and c.outOff >= c.outbuf.len:
-      closeConn(slot)
+      closeConn(r, slot)
       return
+    # Fully drained and nothing new was queued: return the buffer to the pool
+    # (guarded against a deferred/batched response or an armed SEND).
+    maybeReleaseOutBuf(r, c[])
     if not c.closing and not c.readPaused:
-      armRecv(slot)
+      armRecv(r, slot)
   else:
-    armSend(slot)   # partial send: push the remainder
+    armSend(r, slot)   # partial send: push the remainder
 
-proc sweep()   # forward declaration (defined below)
+proc sweep(r: var RingCtx)   # forward declaration (defined below)
 
-proc onTimeout() =
+proc onTimeout(r: var RingCtx) =
   # Idle/stall sweep moved here from the per-pass hot path: walking every
   # registered slot on each completion batch was pure overhead; the 1 s timer
   # is the natural sweep cadence.
-  sweep()
+  sweep(r)
+  if gZeroCopyStats:
+    # Diagnostic only, once per 1 s tick (never on the recv fast path), so the
+    # counters are observable without an allocation per request or an endpoint.
+    stderr.writeLine("zerocopy stats: direct_requests=" & $recvDirectRequests &
+                     " copied_buffers=" & $recvCopiedBuffers)
   # Retry sends that hit a transient -ENOBUFS (never dropped, never spun on).
-  if gSendRetry.len > 0:
-    let pend = gSendRetry
-    gSendRetry.setLen(0)
+  # A deferred slot is deliberately excluded: its output contains a response
+  # produced by an open group-commit batch, and the only safe arming point is
+  # `flushDeferredSlots` after COMMIT. Arming it here would either put
+  # uncommitted success bytes on the wire or let a failed commit rewrite the
+  # buffer (`setLen`/`addResponse`) while the SQE holds `addr c.outbuf[c.outOff]`.
+  if r.sendRetry.len > 0:
+    let pend = r.sendRetry
+    r.sendRetry.setLen(0)
     for sr in pend:
       let slot = sr.slot
-      if slot >= 0 and int(slot) < conns.len:
-        var c = addr conns[int(slot)]
+      if slot >= 0 and int(slot) < r.conns.len:
+        var c = addr r.conns[int(slot)]
         if c.gen == sr.gen and c.active and not c.sendArmed and
-           c.outOff < c.outbuf.len:
-          armSend(slot)
+           not c.deferred and c.outOff < c.outbuf.len:
+          armSend(r, slot)
   # Re-arm recvs starved of provided buffers.
-  if gRecvStarved.len > 0 and gBufsReady > 0:
-    rearmStarved()
-  if gAcceptPaused:
-    gAcceptPaused = false
-    armAccept()
-  elif not gAcceptArmed:
-    armAccept()
-  armTimeout()
+  if r.recvStarved.len > 0 and r.bufsReady > 0:
+    rearmStarved(r)
+  if r.acceptPaused:
+    r.acceptPaused = false
+    armAccept(r)
+  elif not r.acceptArmed:
+    armAccept(r)
+  armTimeout(r)
+  # Multi-ring fairness is measured, not predicted: SO_REUSEPORT hashes each
+  # connection by 4-tuple, so the split can be uneven. One cheap line per ring
+  # every 10 ticks (10 s) is the whole cost, and only on the N>1 path.
+  if r.multiRing:
+    inc r.ticks
+    if r.ticks mod 10 == 0:
+      var live = 0
+      for i in 1 ..< r.conns.len:
+        if r.conns[i].active: inc live
+      stderr.writeLine("io_uring ring " & $r.id & ": accepted=" & $r.accepted &
+                       " live=" & $live & " slots=" & $r.slots)
 
 # ---------------------------------------------------------------------------
 # idle / stall sweep
 
-proc sweep() =
-  for slot in 0 ..< conns.len:
-    if conns[slot].active:
-      let pendingOut = conns[slot].sendArmed or
-                       conns[slot].outOff < conns[slot].outbuf.len
-      let midReq = conns[slot].inbuf.len > 0
+proc sweep(r: var RingCtx) =
+  ## Slots at or above `r.conns.len` were never handed out, so they cannot hold a
+  ## live connection and need no work. Slot 0 is the listener, never a Conn.
+  for slot in 1 ..< r.conns.len:
+    if r.conns[slot].active:
+      let pendingOut = r.conns[slot].sendArmed or
+                       r.conns[slot].outOff < r.conns[slot].outbuf.len
+      let midReq = r.conns[slot].inbuf.len > 0
       let limit = if pendingOut or midReq: StallTimeout else: IdleKeepAlive
-      if gNow - conns[slot].lastActive > limit:
-        closeConn(cint(slot))
+      if gNow - r.conns[slot].lastActive > limit:
+        closeConn(r, cint(slot))
 
 # ---------------------------------------------------------------------------
 # reaping
 
-proc dispatch(ud: uint64, res: cint, cflags: uint32) =
+proc onClose(r: var RingCtx; slot: cint; res: cint) =
+  ## Only failures reach here: a successful fixed CLOSE carries
+  ## IOSQE_CQE_SKIP_SUCCESS. The kernel did not free the slot, so drop the
+  ## still-registered descriptor with the register-update fallback; otherwise a
+  ## direct accept could never reuse it.
+  if res >= 0 or slot < 0 or int(slot) >= r.slots:
+    return
+  let rc = updateSlotRaw(r, slot, -1'i32)
+  stderr.writeLine("io_uring: fixed close failed for slot " & $slot &
+                   " res=" & $res & " (fallback rc=" & $rc & ")")
+
+proc onProvide(r: var RingCtx; gen: uint32; res: cint) =
+  ## Only failures reach here: a successful PROVIDE_BUFFERS is skipped. The
+  ## buffer(s) never entered the kernel's buffer group, so undo the optimistic
+  ## `bufsReady` count (gen=1: one buffer from poolPush; gen=0: the bulk fill).
+  if res >= 0:
+    return
+  if gen == 1'u32:
+    if r.bufsReady > 0: dec r.bufsReady
+  else:
+    r.bufsReady = 0
+  stderr.writeLine("io_uring: PROVIDE_BUFFERS failed res=" & $res)
+
+proc dispatch(r: var RingCtx; ud: uint64, res: cint, cflags: uint32) =
+  ## A ring only ever sees completions for its own submissions, but the ring id
+  ## is explicit in user_data so a mis-routed CQE can never touch another ring's
+  ## slot table (dispatch routes by this field).
+  if udRing(ud) != r.id:
+    return
   case udTag(ud)
-  of TAG_ACCEPT:  onAccept(res, (cflags and IORING_CQE_F_MORE) != 0'u32)
-  of TAG_RECV:    onRecv(udSlot(ud), udGen(ud), res, cflags)
-  of TAG_SEND:    onSend(udSlot(ud), udGen(ud), res)
-  of TAG_TIMEOUT: onTimeout()
-  of TAG_CANCEL:  discard
-  of TAG_PROVIDE: discard
+  of TAG_ACCEPT:  onAccept(r, res, (cflags and IORING_CQE_F_MORE) != 0'u32)
+  of TAG_RECV:    onRecv(r, udSlot(ud), udGen(ud), res, cflags)
+  of TAG_SEND:    onSend(r, udSlot(ud), udGen(ud), res)
+  of TAG_TIMEOUT: onTimeout(r)
+  of TAG_CLOSE:   onClose(r, udSlot(ud), res)
+  of TAG_PROVIDE: onProvide(r, udGen(ud), res)
+  of TAG_CANCEL:
+    # Success is skipped. -ENOENT is a normal miss (the target already
+    # completed); anything else is worth surfacing.
+    if res != 0 and res != -ENOENT:
+      stderr.writeLine("io_uring: async cancel failed res=" & $res)
   else:           discard
 
-proc flushDeferredSlots(commitOk: bool) =
+proc flushDeferredSlots(r: var RingCtx; commitOk: bool) =
   ## Release the SENDs withheld during this pass, once the pass's batch has been
   ## committed (or has failed). On a failed COMMIT every response produced against
   ## the rolled-back batch is replaced by a 500, so no success byte for an
   ## uncommitted write can reach the socket.
-  for sr in gDeferredSlots:
+  for sr in r.deferredSlots:
     let slot = sr.slot
-    if slot < 0 or int(slot) >= conns.len:
+    if slot < 0 or int(slot) >= r.conns.len:
       continue
-    var c = addr conns[int(slot)]
+    var c = addr r.conns[int(slot)]
     if c.gen != sr.gen:
       continue                      # slot reused by another connection: stale
     c.deferred = false
@@ -1102,29 +1611,93 @@ proc flushDeferredSlots(commitOk: bool) =
     c.batchFrom = 0
     c.batchCount = 0
     if c.outOff < c.outbuf.len:
-      armSend(slot)
+      armSend(r, slot)
     if c.closing and not c.sendArmed and c.outOff >= c.outbuf.len:
-      closeConn(slot)
-  gDeferredSlots.setLen(0)
+      closeConn(r, slot)
+  r.deferredSlots.setLen(0)
 
-proc runLoop() =
+proc drainCompletions(r: var RingCtx): int =
+  ## Drain the *entire* completion queue of one ring and return how many CQEs
+  ## were handled. Never blocks. If the kernel reports IORING_SQ_CQ_OVERFLOW it
+  ## parked completions that did not fit in the CQ ring on its internal overflow
+  ## list; re-enter (non-blocking GETEVENTS) to move them into the space we just
+  ## freed, then drain again, until the flag clears. The flag is only set when
+  ## the CQ actually filled, so the common case costs one `sqOverflowed()` read.
+  result = 0
+  while true:
+    # Consume kernel-visible CQEs with a local cursor and publish the advanced
+    # head ONCE per drained batch. The kernel cannot overwrite an entry until
+    # head passes it, so the cursor is safe for the whole batch (and a handler
+    # that enters mid-batch only makes the tail advance).
+    let start = r.ring.cqHead()
+    var head = start
+    while true:
+      let tail = r.ring.cqTail()
+      if head == tail:
+        break
+      let cqe = r.ring.cqeAt(head)
+      let ud = cqe.user_data
+      let res = cqe.res
+      let fl = cqe.flags
+      inc head
+      inc result
+      try:
+        dispatch(r, ud, res, fl)
+      except IoRingError as ex:
+        # `mustSqe` inside a handler can fail (e.g. a transient enter error).
+        # That must not take the whole transport down: the ring itself is still
+        # usable, so log the failed operation and keep draining.
+        stderr.writeLine("io_uring dispatch error: " & ex.msg)
+    if head != start:
+      r.ring.cqeSeenMany(head - start)
+    # Publish buffers returned during this batch before anything can enter.
+    flushBufTail(r)
+    if not r.ring.sqOverflowed():
+      break
+    # CQ overflowed: nudge the kernel to flush the overflow list into the
+    # CQ space freed above, then drain those completions too.
+    try:
+      discard r.ring.enterGetEvents()
+    except IoRingError as ex:
+      if ex.errno == EINTR:
+        continue
+      stderr.writeLine("io_uring_enter failed: " & ex.msg)
+      quit(1)
+
+proc runLoop(r: var RingCtx) =
   ## One thread, one ring. Per pass we drain the *entire* completion queue in a
   ## single loop, do the send-side work, then loop. The end-of-pass submit is
   ## deliberately omitted: the wait at the top of the next iteration flushes
   ## every SQE reserved during the drain, so the steady-state hot loop costs
-  ## exactly ONE io_uring_enter per pass (plus whatever `mustSqe()` is forced to
+  ## exactly ONE io_uring_enter per pass (plus whatever `mustSqe(r)` is forced to
   ## flush if the SQ genuinely fills mid-drain).
   ##
   ## The wait is the blocking GETEVENTS enter, so the loop sleeps until a
-  ## completion is ready. The armed 1 s tick CQE bounds the idle wakeup, and the
-  ## completion queue is drained whole, so the tick CQE is processed exactly as
-  ## before and the idle/stall sweep keeps its cadence.
-  armAccept()
-  armTimeout()
+  ## completion is ready.  Under sustained load (the previous pass drained at
+  ## least `BatchLoadThreshold` completions) it waits for a small batch with a
+  ## 100 us cap instead, which amortises the enter syscall without delaying a
+  ## backlog: `min_complete` counts CQEs already in the ring, and an already
+  ## queued completion is drained on the immediate single-completion path.  The
+  ## armed 1 s tick CQE still bounds the idle wakeup, and the completion queue is
+  ## drained whole, so the tick CQE is processed exactly as before and the
+  ## idle/stall sweep keeps its cadence.
+  ##
+  ## This is the N=1 path; `runMultiLoop` is the only other waiter, and it
+  ## never calls into this proc.
+  var batchLoaded = false   # previous pass drained a sustained load batch
+  armAccept(r)
+  armTimeout(r)
 
   while true:
     try:
-      discard gRing.submitAndWait(1)   # flush reserved SQEs + block for >=1 CQE
+      if batchLoaded and r.ring.peekCqe().isNil:
+        # Sustained load: collect a small batch (bounded by 100 us).  If a
+        # backlog is already queued, `min_complete` is satisfied by those CQEs
+        # and the enter returns without sleeping.
+        discard r.ring.submitAndWaitBatch(BatchMinComplete, BatchMaxUsec)
+      else:
+        # Idle (or completions already waiting): block for one completion.
+        discard r.ring.submitAndWait(1)   # flush reserved SQEs + block for >=1 CQE
     except IoRingError as ex:
       if ex.errno == EINTR:
         continue
@@ -1132,51 +1705,34 @@ proc runLoop() =
       quit(1)
 
     gNow = epochTime()
-    gConsumedThisPass = 0
-    # Drain the *entire* completion queue.  If the kernel reports
-    # IORING_SQ_CQ_OVERFLOW it parked completions that did not fit in the CQ ring
-    # on its internal overflow list; re-enter (non-blocking GETEVENTS) to move
-    # them into the space we just freed, then drain again, until the flag clears.
-    # The flag is only set when the CQ actually filled, so the common case costs
-    # one `sqOverflowed()` read per pass.  This never blocks: `enterGetEvents`
-    # uses min_complete=0, so the loop cannot sleep while overflowed.
-    while true:
-      while true:
-        let cqe = gRing.peekCqe()
-        if cqe.isNil:
-          break
-        let ud = cqe.user_data
-        let res = cqe.res
-        let fl = cqe.flags
-        gRing.cqeSeen()
-        dispatch(ud, res, fl)
-      if not gRing.sqOverflowed():
-        break
-      # CQ overflowed: nudge the kernel to flush the overflow list into the
-      # CQ space freed above, then drain those completions too.
-      try:
-        discard gRing.enterGetEvents()
-      except IoRingError as ex:
-        if ex.errno == EINTR:
-          continue
-        stderr.writeLine("io_uring_enter failed: " & ex.msg)
-        quit(1)
+    r.consumedThisPass = 0
+    let drained = drainCompletions(r)
+
+    # A pass that drained a real batch means demand is sustained, so the next
+    # wait may collect a batch; a light or empty pass returns to the blocking
+    # single-completion wait immediately (including the 1 s tick wakeup).
+    batchLoaded = drained >= BatchLoadThreshold
 
     # End of one completion-queue pass: commit the pass's write batch (if any)
     # and only then arm the SENDs withheld for it (rule 6: durable before send).
     if gDb != nil and gDb.batchOpen():
-      flushDeferredSlots(gDb.commitBatch())
+      flushDeferredSlots(r, gDb.commitBatch())
 
-    # Checkpoint the WAL off the request path, at most once a second.
-    if gNow - gLastCkpt >= 1.0:
-      gLastCkpt = gNow
-      if gDb != nil:
-        gDb.checkpointPassive()
+    # End the pass's read snapshot HERE: after the write commit (which already
+    # ended it for a read->write pass). A read transaction must never survive a
+    # pass, otherwise the connection would keep reading a stale snapshot and the
+    # checkpointer could not backfill the frames it still covers.
+    #
+    # The WAL checkpoint is NOT run here. It lives on its own connection/thread
+    # (started below) and is driven by the wal_hook, so this loop never performs
+    # checkpoint I/O: no page copy and no fsync on the request thread.
+    if gDb != nil and not gDb.endRead():
+      stderr.writeLine("db: COMMIT of the pass read transaction failed")
 
     # Buffers returned during this pass may have un-starved recvs that hit
     # -ENOBUFS earlier in the same pass.
-    if gRecvStarved.len > 0 and gConsumedThisPass > 0 and gBufsReady > 0:
-      rearmStarved()
+    if r.recvStarved.len > 0 and r.consumedThisPass > 0 and r.bufsReady > 0:
+      rearmStarved(r)
 
 # ---------------------------------------------------------------------------
 # setup
@@ -1194,83 +1750,94 @@ proc envIsOneshot(name: string): bool =
   ## "oneshot") selects the conservative one-shot path.
   getEnv(name, "multishot").toLowerAscii == "oneshot"
 
-proc initPool() =
-  ## Allocate the shared provided-buffer pool and publish it to the kernel.
+proc initPool(r: var RingCtx; defaultSlots: int) =
+  ## Allocate this ring's provided-buffer pool and publish it to the kernel.
   ## The data region is one lazily-faulted `alloc`: untouched pages stay out of
   ## RSS, and because buffers are only taken while bytes are in flight, the
   ## resident cost tracks peak concurrent receives rather than connection count.
-  # Live pool size (IOURING_BUFS, default BufRingDefault): rounded down to a power
-  # of two and clamped, so the buf-ring requirement always holds. Exposed so the
-  # -ENOBUFS path can be exercised (a tiny pool) without a rebuild.
-  var want = BufRingDefault
+  # Live pool size (IOURING_BUFS, default `defaultSlots`): rounded down to a
+  # power of two and clamped, so the buf-ring requirement always holds. Exposed
+  # so the -ENOBUFS path can be exercised (a tiny pool) without a rebuild. The
+  # caller passes BufRingDefault for one ring and the per-ring share of
+  # MultiBufBudget for N rings.
+  var want = defaultSlots
   try:
-    want = parseInt(getEnv("IOURING_BUFS", $BufRingDefault))
+    want = parseInt(getEnv("IOURING_BUFS", $defaultSlots))
   except ValueError:
-    want = BufRingDefault
+    want = defaultSlots
   if want < 64: want = 64
   if want > BufRingMax: want = BufRingMax
   var p2 = 1
   while p2 * 2 <= want: p2 *= 2
-  gBufSlots = p2
-  gBufMask = p2 - 1
+  r.bufSlots = p2
+  r.bufMask = p2 - 1
 
-  let bytes = gBufSlots * BufSize
-  gBufBase = cast[ptr UncheckedArray[char]](alloc(bytes))
-  if gBufBase.isNil:
+  let bytes = r.bufSlots * BufSize
+  r.bufBase = cast[ptr UncheckedArray[char]](alloc(bytes))
+  if r.bufBase.isNil:
     stderr.writeLine("io_uring: buffer pool alloc failed (" & $bytes & " bytes)")
     quit(1)
 
   # The descriptor ring must be page aligned; mmap gives us that for free.
-  let ringBytes = gBufSlots * sizeof(BufRingEntry)
+  let ringBytes = r.bufSlots * sizeof(BufRingEntry)
   let p = posix.mmap(nil, ringBytes, PROT_READ or PROT_WRITE,
                      MAP_PRIVATE or MAP_ANONYMOUS, -1, Off(0))
   if p.isNil or p == MAP_FAILED:
     stderr.writeLine("io_uring: buf-ring mmap failed (" & $ringBytes & " bytes)")
     quit(1)
-  gBufRing = cast[ptr UncheckedArray[BufRingEntry]](p)
+  r.bufRing = cast[ptr UncheckedArray[BufRingEntry]](p)
 
   # IOURING_BUFRING=0 forces the IORING_OP_PROVIDE_BUFFERS path (for testing the
   # degradation); otherwise we try the registered ring and fall back on failure.
   if getEnv("IOURING_BUFRING", "1") == "0":
-    gUseBufRing = false
+    r.useBufRing = false
     stderr.writeLine("io_uring: IOURING_BUFRING=0; using IORING_OP_PROVIDE_BUFFERS")
   else:
     try:
-      discard gRing.registerBufRing(p, uint32(gBufSlots), BufGroup)
-      gUseBufRing = true
+      discard r.ring.registerBufRing(p, uint32(r.bufSlots), BufGroup)
+      r.useBufRing = true
     except IoRingError as ex:
-      gUseBufRing = false
+      r.useBufRing = false
       stderr.writeLine("io_uring: PBUF_RING unavailable (" & ex.msg &
                        "); falling back to IORING_OP_PROVIDE_BUFFERS")
 
-  gBufTail = 0
-  gBufsReady = 0
-  if gUseBufRing:
-    for bid in 0 ..< gBufSlots:
-      poolPush(bid)
+  r.bufTail = 0
+  r.bufTailPending = false
+  r.bufsReady = 0
+  if r.useBufRing:
+    for bid in 0 ..< r.bufSlots:
+      poolPush(r, bid)
+    flushBufTail(r)               # one tail publish for the whole initial fill
   else:
     # One SQE hands the whole list to buffer group BufGroup, ids 0..N-1.
-    let sqe = mustSqe()
+    let sqe = mustSqe(r)
     if sqe.isNil:
       stderr.writeLine("io_uring: could not submit PROVIDE_BUFFERS")
       quit(1)
-    prepProvideBuffers(sqe, cast[uint64](addr gBufBase[0]), uint32(BufSize),
-                       uint32(gBufSlots), 0'u16, BufGroup)
-    sqe.user_data = TAG_PROVIDE
-    gBufsReady = gBufSlots
-    discard gRing.submit()
+    prepProvideBuffers(sqe, cast[uint64](addr r.bufBase[0]), uint32(BufSize),
+                       uint32(r.bufSlots), 0'u16, BufGroup)
+    sqe.flags = IOSQE_CQE_SKIP_SUCCESS
+    # gen=0 marks the bulk provide (poolPush uses gen=1 for a single buffer).
+    sqe.user_data = makeUd(TAG_PROVIDE, r.id, 0, 0)
+    r.bufsReady = r.bufSlots
+    discard r.ring.submit()
 
-  stderr.writeLine("io_uring pool: " & $gBufSlots & " x " & $BufSize &
+  stderr.writeLine((if r.multiRing: "[ring " & $r.id & "] " else: "") &
+                   "io_uring pool: " & $r.bufSlots & " x " & $BufSize &
                    " B (" & $(bytes div (1024 * 1024)) & " MiB, " &
-                   (if gUseBufRing: "registered buf_ring"
+                   (if r.useBufRing: "registered buf_ring"
                     else: "provide_buffers list") & ")")
 
 # ---------------------------------------------------------------------------
 # Startup failure policy.
 #
-# Every per-feature failure (flagged setup, multishot recv, multishot/direct
-# accept, buf_ring) degrades in place with the server staying up. The only
-# unrecoverable case is a failure that leaves the transport itself unavailable:
+# A rejected setup-flag set, a refused multishot/direct accept and an
+# unavailable buf_ring degrade in place with the server staying up. Multishot
+# recv is different: it has no runtime fallback. A kernel without
+# IORING_RECV_MULTISHOT fails the recv, which reaches onRecv's terminal-error
+# path (the connection is closed); the operator must start with
+# IOURING_RECV=oneshot on such a kernel. The only unrecoverable case is a
+# failure that leaves the transport itself unavailable:
 # `io_uring_setup` rejecting the ring (-ENOSYS on a kernel/VM without io_uring,
 # -EPERM under seccomp, -ENOMEM for the ring) or the fixed-file registration
 # being refused even at the floor. There is exactly one transport, so there is
@@ -1281,133 +1848,407 @@ proc hardFail(reason: string) {.noreturn.} =
                    "); no fallback transport is built in")
   quit(1)
 
+# ---------------------------------------------------------------------------
+# multi-ring event loop (N > 1)
+#
+# One request thread owns every ring, so SINGLE_ISSUER / COOP_TASKRUN stay
+# valid (they bind a ring to its creating task, not to one ring per process).
+# No ring is ever entered with a blocking wait while another ring could have
+# completions.
+#
+# DEFER_TASKRUN is deliberately NOT requested for N>1. Deferred task work only
+# runs inside io_uring_enter, and the wake source this loop has to sleep on is
+# the shared eventfd (one IORING_REGISTER_EVENTFD per ring, one epoll set over
+# the fd). That eventfd is signalled from the completion commit, which under
+# DEFER_TASKRUN is precisely the work parked until someone enters: at low load
+# the loop drained the counter, slept in epoll_wait(-1), and nothing ever
+# entered again. The first ring's completions could be parked with cq head ==
+# tail and no eventfd signal, so neither the armed 1 s tick nor a new request
+# woke the loop (measured: ~60-124 requests then do_epoll_wait forever;
+# /health hung). Without DEFER_TASKRUN completions commit (and signal the eventfd)
+# from the context that completes them, so the wait is self-sustaining. N=1
+# keeps DEFER_TASKRUN: its loop calls submitAndWait itself, which is the enter
+# that runs the deferred work. If the kernel rejects the multi flags,
+# setupQueue's existing bare retry applies.
+#
+# On every wake the loop drains the eventfd counter, then runs a non-blocking
+# io_uring_enter(GETEVENTS, min_complete=0) on EVERY ring to flush reserved
+# SQEs and any CQ overflow, then drainCompletions walks each ring. No busy-spin:
+# with no work the only wake is each ring's own 1 s tick, and a completion that
+# lands after the counter read bumps the eventfd again and wakes the next
+# epoll_wait.
+proc runMultiLoop(rings: var seq[RingCtx]) =
+  let ep = epoll_create1(0)
+  if ep < 0:
+    hardFail("epoll_create1 failed: errno=" & $(osLastError().int))
+
+  # One shared eventfd, registered on every ring. The kernel bumps its counter
+  # once per completion event; a single read both observes and clears it.
+  var wakeFd = c_eventfd(0'u32, cint(EFD_NONBLOCK or EFD_CLOEXEC))
+  if wakeFd < 0:
+    hardFail("eventfd failed: errno=" & $(osLastError().int))
+  for i in 0 ..< rings.len:
+    let rc = c_syscall(SYS_io_uring_register, clong(rings[i].ring.fd),
+                       clong(IORING_REGISTER_EVENTFD),
+                       clong(cast[uint](addr wakeFd)), clong(1))
+    if rc < 0:
+      hardFail("IORING_REGISTER_EVENTFD ring " & $i & " failed: errno=" &
+               $(osLastError().int))
+    armAccept(rings[i])
+    armTimeout(rings[i])
+
+  var ev: EpollEvent
+  ev.events = EPOLLIN
+  ev.data.fd = wakeFd
+  if epoll_ctl(ep, EPOLL_CTL_ADD, wakeFd, addr ev) != 0:
+    hardFail("epoll_ctl(ADD) eventfd failed: errno=" & $(osLastError().int))
+
+  var event: EpollEvent
+  while true:
+    # Flush SQEs reserved during the previous drain. submit() is the
+    # non-blocking enter (min_complete=0) and cannot stall another ring.
+    for i in 0 ..< rings.len:
+      if rings[i].ring.toSubmit > 0:
+        try:
+          discard rings[i].ring.submit()
+        except IoRingError as ex:
+          if ex.errno == EINTR:
+            continue
+          stderr.writeLine("io_uring_enter failed: " & ex.msg)
+          quit(1)
+
+    let n = epoll_wait(ep, addr event, 1, -1)
+    if n < 0 and osLastError().int != EINTR:
+      stderr.writeLine("epoll_wait failed: errno=" & $(osLastError().int))
+      quit(1)
+
+    # Clear the shared counter. A completion that lands after this read bumps
+    # it again and wakes the next epoll_wait, so the wake is never lost.
+    var counter: uint64
+    while posix.read(wakeFd, addr counter, 8) == 8:
+      discard
+
+    # Run deferred task work / flush reservations on every ring. This is a
+    # non-blocking enter: min_complete == 0, so a ring with nothing ready
+    # returns immediately and the pass drains all rings in a fixed order.
+    for i in 0 ..< rings.len:
+      try:
+        discard rings[i].ring.enterGetEvents()
+      except IoRingError as ex:
+        if ex.errno == EINTR:
+          continue
+        stderr.writeLine("io_uring_enter failed: " & ex.msg)
+        quit(1)
+
+    gNow = epochTime()
+    for i in 0 ..< rings.len:
+      rings[i].consumedThisPass = 0
+      discard drainCompletions(rings[i])
+
+    # ONE pass boundary for the whole process: the group-commit batch opened by
+    # any ring's request is committed once, then every ring's deferred SENDs
+    # are armed with the same commit result (rule 6: durable before send). A
+    # read transaction opened by any ring also ends here, exactly like N=1.
+    if gDb != nil and gDb.batchOpen():
+      let commitOk = gDb.commitBatch()
+      for i in 0 ..< rings.len:
+        flushDeferredSlots(rings[i], commitOk)
+    if gDb != nil and not gDb.endRead():
+      stderr.writeLine("db: COMMIT of the pass read transaction failed")
+
+    # Buffers returned during this pass may have un-starved recvs that hit
+    # -ENOBUFS earlier in the same pass. Per ring: the pools are not shared.
+    for i in 0 ..< rings.len:
+      if rings[i].recvStarved.len > 0 and rings[i].consumedThisPass > 0 and
+         rings[i].bufsReady > 0:
+        rearmStarved(rings[i])
+
+# ---------------------------------------------------------------------------
+# ring sizing
+
+proc readConntrackMax(): int =
+  ## /proc/sys/net/netfilter/nf_conntrack_max, or 0 when conntrack is not
+  ## available. 0 means "cannot prove capacity beyond one ring", so auto-size
+  ## stays at one ring.
+  try:
+    result = parseInt(readFile("/proc/sys/net/netfilter/nf_conntrack_max").strip())
+    if result < 0: result = 0
+  except CatchableError:
+    result = 0
+
+proc autoBufferSlots(rings: int): int =
+  ## Per-ring share of the bounded global provided-buffer budget, rounded down
+  ## to a power of two. initPool clamps it to [64, BufRingMax] afterwards. N=1
+  ## keeps the measured BufRingDefault point unchanged.
+  if rings <= 1:
+    return BufRingDefault
+  var want = MultiBufBudget div rings
+  if want < 64: want = 64
+  result = 1
+  while result * 2 <= want:
+    result *= 2
+
+proc planRings(hardNofile: int):
+    tuple[rings, slotsPerRing, conntrackMax: int;
+          slotsForced, ringsForced: bool] =
+  ##   slotsPerRing = min(hardNofile - FdsReserve, 65,535)
+  ##   target       = min(conntrackMax - ConntrackHeadroom, MaxConns)
+  ##   rings        = clamp(ceil(target / slotsPerRing), 1, 5)
+  ##
+  ## With the current 64k conntrack cap the target (64,512) fits in one
+  ## 65,535-slot table, so the default configuration is exactly one ring.
+  ## NIM_SLOTS_PER_RING / NIM_RINGS are the only overrides (used by the
+  ## multi-ring smoke test); they are clamped, and each falls back to its
+  ## automatic value when unset/bad.
+  var slots = min(hardNofile - FdsReserve, MaxSlotsPerRing)
+  if slots < SlotsFloor:
+    slots = SlotsFloor
+  let envSlots = envIntDef("NIM_SLOTS_PER_RING", 0)
+  result.slotsForced = envSlots > 0
+  if result.slotsForced:
+    slots = min(max(envSlots, SlotsFloor), MaxSlotsPerRing)
+  result.slotsPerRing = slots
+
+  let ct = readConntrackMax()
+  result.conntrackMax = ct
+  let envRings = envIntDef("NIM_RINGS", 0)
+  result.ringsForced = envRings > 0
+  if result.ringsForced:
+    result.rings = min(max(envRings, 1), MaxRings)
+  else:
+    let target =
+      if ct > 0: min(max(ct - ConntrackHeadroom, 0), MaxConns)
+      else: slots
+    let want = if target <= 0: 1 else: (target + slots - 1) div slots
+    result.rings = min(max(want, 1), MaxRings)
+
+const
+  # SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN | NO_SQARRAY: the recommended
+  # setup for a single-threaded, per-thread ring. Completion (task) work is
+  # deferred to io_uring_enter, which runLoop calls every pass; NO_SQARRAY drops
+  # the sq_array indirection (SQE index == tail & mask). A kernel that rejects
+  # NO_SQARRAY loses only that flag (setupQueue strips it first); any remaining
+  # rejected flag set is retried bare, so startup never fails on a hint.
+  #
+  # The N>1 loop must NOT defer task work: its only wake source is the shared
+  # eventfd, which is signalled when a completion is committed - the very work
+  # DEFER_TASKRUN parks until an enter that will never happen. Multi rings
+  # therefore keep SINGLE_ISSUER | COOP_TASKRUN (plus NO_SQARRAY) and drop
+  # DEFER_TASKRUN; every ring is still created and entered by the same request
+  # thread.
+  SingleRingSetupFlags = IORING_SETUP_SINGLE_ISSUER or
+                         IORING_SETUP_DEFER_TASKRUN or
+                         IORING_SETUP_COOP_TASKRUN or
+                         IORING_SETUP_NO_SQARRAY
+  MultiRingSetupFlags  = IORING_SETUP_SINGLE_ISSUER or
+                         IORING_SETUP_COOP_TASKRUN or
+                         IORING_SETUP_NO_SQARRAY
+
+proc setupFlagNames(flags: uint32): string =
+  var parts: seq[string]
+  if (flags and IORING_SETUP_SINGLE_ISSUER) != 0'u32: parts.add "SINGLE_ISSUER"
+  if (flags and IORING_SETUP_DEFER_TASKRUN) != 0'u32: parts.add "DEFER_TASKRUN"
+  if (flags and IORING_SETUP_COOP_TASKRUN) != 0'u32: parts.add "COOP_TASKRUN"
+  if (flags and IORING_SETUP_NO_SQARRAY) != 0'u32: parts.add "NO_SQARRAY"
+  if parts.len == 0: "bare" else: parts.join("|")
+
+proc setupRingRetry(flags: uint32): Ring =
+  ## io_uring_setup allocates the SQE/CQ pages in the kernel; under transient
+  ## host memory pressure it can return -ENOMEM even though the same request
+  ## succeeds moments later. Retry briefly so a startup that races a co-tenant
+  ## build does not abort. Any other errno, or sustained ENOMEM, is still fatal
+  ## (the caller hard-fails, exactly as before).
+  var tries = 0
+  while true:
+    try:
+      return setupQueue(RingEntries, flags,
+                        cuint(RingEntries * CqMultiple))
+    except IoRingError as ex:
+      if ex.errno == ENOMEM and tries < 40:
+        inc tries
+        sleep(50)
+        continue
+      raise
+
 proc main() =
   let cfg = loadConfig()
   gSecret = cfg.jwtSecret
+  gZeroCopyStats = getEnv("ZEROCOPY_STATS", "0") == "1"
 
   discard posix.signal(SIGPIPE, SIG_IGN)
 
-  # Turbo toggles: multishot by default, one env var away from the safe path.
-  gRecvMultishot = not envIsOneshot("IOURING_RECV")
-  gAcceptMultishot = not envIsOneshot("IOURING_ACCEPT")
-  # Direct accept (kernel-installed fixed slots) defaults ON;
-  # IOURING_ACCEPT_DIRECT=0 forces the register-per-accept path so that path can
-  # be exercised.
-  gAcceptDirect = getEnv("IOURING_ACCEPT_DIRECT", "1") != "0"
+  # Turbo toggles are identical for every ring: multishot by default, one env
+  # var away from the safe path. Direct accept (kernel-installed fixed slots)
+  # defaults ON; IOURING_ACCEPT_DIRECT=0 forces register-per-accept.
+  let recvMultishot = not envIsOneshot("IOURING_RECV")
+  let acceptMultishot = not envIsOneshot("IOURING_ACCEPT")
+  var acceptDirect = getEnv("IOURING_ACCEPT_DIRECT", "1") != "0"
   # Direct accept installs the socket kernel-side, so no userspace fd exists to
   # run applyTcpTuning on it. If per-connection TCP tuning is requested, fall
   # back to register-per-accept so the accepted fd is available.
-  if not gAcceptMultishot or tcpNotsentLowatBytes() > 0 or tcpQuickAck():
-    gAcceptDirect = false
+  if not acceptMultishot or tcpNotsentLowatBytes() > 0 or tcpQuickAck():
+    acceptDirect = false
 
-  # Raise the fd ceiling BEFORE registering the fixed-file table (see raiseNofile).
-  # The hard limit it returns sizes the registered fixed-file table below.
+  # Raise the fd ceiling BEFORE registering any fixed-file table (see
+  # raiseNofile). The hard limit it returns sizes each ring's table below.
   let hardNofile = raiseNofile()
+  let plan = planRings(hardNofile)
+  stderr.writeLine("io_uring sizing: hard_nofile=" & $hardNofile &
+                   " conntrack_max=" & $plan.conntrackMax &
+                   " slots_per_ring=" & $plan.slotsPerRing &
+                   " rings=" & $plan.rings &
+                   (if plan.slotsForced: " (NIM_SLOTS_PER_RING)" else: "") &
+                   (if plan.ringsForced: " (NIM_RINGS)" else: ""))
 
-  # ---- runtime fixed-file table size --------------------------------------
-  # Registering N fixed files counts N against RLIMIT_NOFILE, so the table
-  # cannot simply equal the hard limit: reserve headroom for the process's own
-  # descriptors (stdio, io_uring ring, the listener before it is closed, the
-  # sqlite db) or IORING_REGISTER_FILES fails outright - 65536 entries under a
-  # 65535 hard limit is exactly that case. CAP bounds the table; SlotsFloor is
-  # the smallest size we will run with.
-  if hardNofile > 0:
-    gSlots = min(hardNofile - FdsReserve, CAP)
-  if gSlots < SlotsFloor:
-    gSlots = SlotsFloor
+  # ---- rings --------------------------------------------------------------
+  # Every ring is created by THIS thread: SINGLE_ISSUER (and, for N=1,
+  # DEFER_TASKRUN) bind a ring to its creating task, and multi-ring mode
+  # deliberately stays one request thread (the benchmark box is 1 vCPU; rings
+  # add connection capacity, not CPU parallelism).
+  gRings = newSeq[RingCtx](plan.rings)
+  let multi = plan.rings > 1
+  # N=1 keeps DEFER_TASKRUN (runLoop enters to run the deferred work); N>1
+  # drops it because runMultiLoop waits on an eventfd that only the completion
+  # commit can signal (see runMultiLoop).
+  let setupFlags = if multi: MultiRingSetupFlags else: SingleRingSetupFlags
+  let bufSlots = autoBufferSlots(plan.rings)
+  for i in 0 ..< gRings.len:
+    let pfx = if multi: "[ring " & $i & "] " else: ""
+    gRings[i].id = uint8(i)
+    gRings[i].slots = plan.slotsPerRing
+    gRings[i].multiRing = multi
+    gRings[i].recvMultishot = recvMultishot
+    gRings[i].acceptMultishot = acceptMultishot
+    gRings[i].acceptDirect = acceptDirect
 
-  # ---- the ring -----------------------------------------------------------
-  # SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN: the recommended setup for a
-  # single-threaded, per-thread ring. Completion (task) work is deferred to
-  # io_uring_enter, which runLoop calls every pass. A kernel that rejects the
-  # flags is retried bare inside setupQueue, so startup never fails on a hint.
-  const RingSetupFlags = IORING_SETUP_SINGLE_ISSUER or
-                         IORING_SETUP_DEFER_TASKRUN or
-                         IORING_SETUP_COOP_TASKRUN
-  try:
-    gRing = setupQueue(RingEntries, RingSetupFlags,
-                       cuint(RingEntries * CqMultiple))
-  except IoRingError as ex:
-    # Unrecoverable: the ring itself is unavailable.
-    hardFail(ex.msg)
-  if gRing.flagsDropped:
-    stderr.writeLine("io_uring setup: flags 0x" & toHex(gRing.requestedFlags) &
-                     " rejected; running WITHOUT SINGLE_ISSUER|DEFER_TASKRUN")
-  else:
-    stderr.writeLine("io_uring setup: flags 0x" & toHex(gRing.usedFlags) &
-                     " in effect (SINGLE_ISSUER|DEFER_TASKRUN|COOP_TASKRUN)")
-
-  # CQ headroom, observed from the kernel (not assumed): the params the kernel
-  # filled in report the SQ/CQ ring sizes it actually allocated.
-  stderr.writeLine("io_uring ring: sq_entries=" & $gRing.params.sq_entries &
-                   " cq_entries=" & $gRing.params.cq_entries &
-                   " (CQSIZE request=" & $(RingEntries * CqMultiple) &
-                   ", kernel default=2x sq=" & $(RingEntries * 2) & ")")
-
-  # ---- the provided-buffer pool -------------------------------------------
-  initPool()
-
-  # ---- listener -----------------------------------------------------------
-  # Shared socket/bind/listen. deferSec=1 enables TCP_DEFER_ACCEPT: the kernel
-  # holds a completed handshake back from accept until the client's first byte
-  # arrives, so a silent/impatient connect never wakes the loop. HTTP clients
-  # send the request immediately, so a real request is accepted with no added
-  # latency, and this is a listen-time option only (no per-connection work).
-  let lfd = setupListenSocket(cfg.host, cfg.port, ListenBacklog, 1)
-  if lfd < 0:
-    quit(1)
-
-  # ---- register the fixed-file table: slot 0 = listener, rest empty --------
-  # `gSlots` was already sized from RLIMIT_NOFILE above, but the kernel can still
-  # refuse the top value (e.g. -EMFILE/-EINVAL). Do NOT quit at the first failure
-  # and do NOT halve (halving is how you land back on the removed 32768 cap):
-  # walk the size DOWN in small steps until the kernel accepts it, never below
-  # `SlotsFloor`. Only if even the floor is refused is the transport unusable.
-  while true:
-    var fds = newSeq[cint](gSlots)
-    for i in 0 ..< gSlots:
-      fds[i] = -1'i32
-    fds[0] = lfd
     try:
-      discard gRing.registerFiles(fds)
-      stderr.writeLine("fixed-file table registered: fixed_file_slots=" & $gSlots)
-      break
+      gRings[i].ring = setupRingRetry(setupFlags)
     except IoRingError as ex:
-      stderr.writeLine("IORING_REGISTER_FILES(" & $gSlots & ") failed: " & ex.msg)
-      if gSlots <= SlotsFloor:
-        # Nothing left to give up; the fixed-file transport is unusable here.
-        hardFail("IORING_REGISTER_FILES failed at floor " & $SlotsFloor)
-      # Small step DOWN (~1.5% or 1024 entries, whichever shrinks more), floored.
-      let shrink = max(gSlots div 64, 1024)
-      gSlots = max(SlotsFloor, gSlots - shrink)
-  # The registered reference keeps the listening socket alive, so the process
-  # fd can be released: accepts then address it as fixed slot 0.
-  discard posix.close(lfd)
+      # Unrecoverable: the ring itself is unavailable.
+      hardFail(ex.msg)
+    if gRings[i].ring.flagsDropped:
+      stderr.writeLine(pfx & "io_uring setup: flags 0x" &
+                       toHex(gRings[i].ring.requestedFlags) &
+                       " rejected; running WITHOUT optimisation flags (bare)")
+    else:
+      if (gRings[i].ring.requestedFlags and IORING_SETUP_NO_SQARRAY) != 0'u32 and
+         (gRings[i].ring.usedFlags and IORING_SETUP_NO_SQARRAY) == 0'u32:
+        stderr.writeLine(pfx & "io_uring setup: NO_SQARRAY rejected; using sq_array")
+      stderr.writeLine(pfx & "io_uring setup: flags 0x" &
+                       toHex(gRings[i].ring.usedFlags) & " in effect (" &
+                       setupFlagNames(gRings[i].ring.usedFlags) & ")")
+
+    # CQ headroom, observed from the kernel (not assumed): the params the kernel
+    # filled in report the SQ/CQ ring sizes it actually allocated.
+    stderr.writeLine(pfx & "io_uring ring: sq_entries=" &
+                     $gRings[i].ring.params.sq_entries &
+                     " cq_entries=" & $gRings[i].ring.params.cq_entries &
+                     " (CQSIZE request=" & $(RingEntries * CqMultiple) &
+                     ", kernel default=2x sq=" & $(RingEntries * 2) & ")")
+
+    # ---- the provided-buffer pool -----------------------------------------
+    initPool(gRings[i], bufSlots)
+
+    # ---- listener ---------------------------------------------------------
+    # deferSec=1 enables TCP_DEFER_ACCEPT: the kernel holds a completed
+    # handshake back from accept until the client's first byte arrives, so a
+    # silent/impatient connect never wakes the loop. In multi-ring mode every
+    # ring gets its own SO_REUSEPORT listener on the same host:port; the kernel
+    # spreads new connections across them.
+    gRings[i].listenerFd = setupListenSocket(cfg.host, cfg.port, ListenBacklog,
+                                             1, reusePort = multi)
+    if gRings[i].listenerFd < 0:
+      quit(1)
+
+    # ---- register the fixed-file table: slot 0 = listener, rest empty ------
+    # `slots` was sized from RLIMIT_NOFILE above, but the kernel can still
+    # refuse the top value (e.g. -EMFILE/-EINVAL). Do NOT quit at the first
+    # failure and do NOT halve (halving is how you land back on the removed
+    # 32768 cap): walk the size DOWN in small steps until the kernel accepts it,
+    # never below `SlotsFloor`. Only if even the floor is refused is the
+    # transport unusable. Each ring shrinks independently: total capacity is
+    # the sum of the tables that were actually accepted.
+    while true:
+      var fds = newSeq[cint](gRings[i].slots)
+      for j in 0 ..< gRings[i].slots:
+        fds[j] = -1'i32
+      fds[0] = gRings[i].listenerFd
+      try:
+        discard gRings[i].ring.registerFiles(fds)
+        stderr.writeLine(pfx & "fixed-file table registered: fixed_file_slots=" &
+                         $gRings[i].slots)
+        break
+      except IoRingError as ex:
+        stderr.writeLine(pfx & "IORING_REGISTER_FILES(" & $gRings[i].slots &
+                         ") failed: " & ex.msg)
+        if gRings[i].slots <= SlotsFloor:
+          # Nothing left to give up; the fixed-file transport is unusable here.
+          hardFail("IORING_REGISTER_FILES failed at floor " & $SlotsFloor)
+        # Small step DOWN (~1.5% or 1024 entries, whichever shrinks more).
+        let shrink = max(gRings[i].slots div 64, 1024)
+        gRings[i].slots = max(SlotsFloor, gRings[i].slots - shrink)
+    # The registered reference keeps the listening socket alive, so the process
+    # fd can be released: accepts then address it as fixed slot 0.
+    discard posix.close(gRings[i].listenerFd)
+
+    # ---- slot pools -------------------------------------------------------
+    # Reserve the full fixed-file-table capacity once, but commit length only
+    # as slots are actually used: RSS follows live connections instead of
+    # paying the whole slots * sizeof(Conn) at startup. Slot 0 is the listener
+    # and is never a Conn, so the length starts at 1 and nextSlot at 1.
+    gRings[i].conns = newSeqOfCap[Conn](gRings[i].slots)
+    gRings[i].conns.setLen(1)
+    assert gRings[i].conns.capacity >= gRings[i].slots
+    gRings[i].nextSlot = 1
+    # The free list starts empty: releaseSlot refills it as connections close,
+    # and until then allocSlot commits fresh slots through nextSlot.
+    gRings[i].freeSlots = newSeq[cint](gRings[i].slots - 1)
+    gRings[i].freeTop = 0
 
   # ---- database -----------------------------------------------------------
+  # ONE connection, owned by the ONE request thread. The checkpoint pthread and
+  # its second connection are unchanged; no lock is added anywhere.
   gDb = openDb(cfg.sqlitePath)
   # Write batching across one completion-queue pass; GROUP_COMMIT=0 restores
   # autocommit. Default ON.
   gDb.setGroupCommit(groupCommitEnabled())
+  # Dedicated checkpoint connection + thread, plus the WAL hook on the request
+  # connection. From here on every commit raises the hook's atomic flag and the
+  # worker runs PASSIVE checkpoints; the request loop never checkpoints.
+  gDb.startCheckpointer()
   markStart()
 
-  # ---- slot pools ---------------------------------------------------------
-  conns = newSeq[Conn](gSlots)
-  gFreeSlots = newSeq[cint](gSlots - 1)
-  for i in 1 ..< gSlots:
-    gFreeSlots[i - 1] = cint(i)
-  gFreeTop = gSlots - 1
+  let recvStr = if recvMultishot: "multishot" else: "oneshot"
+  let acceptStr =
+    if not acceptMultishot: "oneshot"
+    elif acceptDirect: "multishot+direct"
+    else: "multishot"
+  if not multi:
+    stderr.writeLine("io_uring transport: entries=" & $RingEntries &
+                     " fixed_file_slots=" & $gRings[0].slots &
+                     " recv=" & recvStr & " accept=" & acceptStr)
+    stderr.writeLine("slot array: sizeof(conn)=" & $sizeof(Conn) &
+                     " slots=" & $gRings[0].slots &
+                     " bytes=" & $(gRings[0].slots * sizeof(Conn)))
+  else:
+    var totalSlots = 0
+    var slotLst = ""
+    for i in 0 ..< gRings.len:
+      totalSlots += gRings[i].slots
+      if i > 0: slotLst.add ","
+      slotLst.add $gRings[i].slots
+    stderr.writeLine("io_uring multi-ring transport: entries=" & $RingEntries &
+                     " rings=" & $gRings.len &
+                     " slots_per_ring=[" & slotLst & "]" &
+                     " total_fixed_file_slots=" & $totalSlots &
+                     " recv=" & recvStr & " accept=" & acceptStr)
+    stderr.writeLine("slot array: sizeof(conn)=" & $sizeof(Conn) &
+                     " total_slots=" & $totalSlots &
+                     " bytes=" & $(totalSlots * sizeof(Conn)))
 
-  stderr.writeLine("io_uring transport: entries=" & $RingEntries &
-                   " fixed_file_slots=" & $gSlots &
-                   " recv=" & (if gRecvMultishot: "multishot" else: "oneshot") &
-                   " accept=" & (if not gAcceptMultishot: "oneshot"
-                                elif gAcceptDirect: "multishot+direct"
-                                else: "multishot"))
-  stderr.writeLine("slot array: sizeof(conn)=" & $sizeof(Conn) &
-                   " slots=" & $gSlots &
-                   " bytes=" & $(gSlots * sizeof(Conn)))
-
-  runLoop()
+  if gRings.len == 1:
+    runLoop(gRings[0])
+  else:
+    runMultiLoop(gRings)
 
 main()
