@@ -1,7 +1,7 @@
 ## test_jsonbuf.nim: byte-exact proof for the SSE2 JSON string escaper.
 ##
 ## The production `addEscaped` scans sixteen bytes at a time; the scalar routine
-## below is the OLD implementation kept here *only* as an oracle. Every case
+## below is kept here *only* as an oracle. Every case
 ## compares the production output / wire form against that oracle byte-for-byte:
 ##
 ##   * all 256 possible byte values as singleton strings,
@@ -19,7 +19,7 @@ import ../src/jsonbuf
 const Hex = "0123456789abcdef"
 
 # ---------------------------------------------------------------------------
-# Scalar oracle: the previous per-byte implementation, test-only.
+# Scalar oracle: the per-byte implementation, test-only.
 # ---------------------------------------------------------------------------
 proc scalarEscaped(s: string): string =
   for c in s:

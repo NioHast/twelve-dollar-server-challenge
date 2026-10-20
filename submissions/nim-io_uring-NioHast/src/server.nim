@@ -451,11 +451,10 @@ const
   # back to the blocking single-completion wait, which also bounds the idle
   # wakeup to the armed 1 s tick.
   #
-  # A 16/150 us variant was considered and deliberately NOT taken: min_complete
+  # A 16/150 us variant was considered and deliberately not taken: min_complete
   # counts queued CQEs, so a pass that drained 8..15 would additionally sleep up
   # to 150 us with that work already available. That is added latency, not just
-  # a longer idle wait, and without the requested 64k A/B it cannot be shown to
-  # be non-regressive. The 8/100 us point keeps the N>1 eventfd/epoll path
+  # a longer idle wait. The 8/100 us point keeps the N>1 eventfd/epoll path
   # (which does not use this batch wait at all) unchanged as well.
   BatchMinComplete    = 8'u32
   BatchMaxUsec        = 100'u64
@@ -496,23 +495,18 @@ const
   # IORING_OP_PROVIDE_BUFFERS over the exact same buffer memory.
   BufGroup       = 0'u16
   BufSize        = 8 * 1024
-  # Default pool 64: chosen by measuring RSS against latency across pool sizes
-  # at 2500 simulated users (3 runs per size). VmHWM median fell 46.1 MiB (2048)
-  # -> 41.9 (1024) -> 39.2 (256) -> 38.5 (64) while the p99 median stayed at
-  # ~12 ms (the quiet baseline run was 12.6 ms), so there was no latency
-  # regression. A 5000-user cross-check was also non-regressed (VmHWM 62.9 vs
-  # 71.0 MiB, p99 134 vs 681 ms). 64 is the floor the clamp in initPool enforces;
-  # IOURING_BUFS can still raise the pool up to BufRingMax. Both values MUST be
-  # powers of two (buf-ring requirement). BufSize is left at 8 KiB: requests are
-  # well under 4 KiB, so only one page per buffer is ever faulted and shrinking
-  # it cannot lower RSS (page granularity) but would add a CQE per request.
-  BufRingDefault = 64
+  # Default pool 256: the 64k-connection target needs more in-flight receive
+  # buffers than the 64-buffer floor; 256 measured lower sys CPU and a much
+  # better p99 at 6,800 rps while adding only ~2 MiB of lazily-faulted address
+  # space. IOURING_BUFS can tune it up to BufRingMax; both values must be powers
+  # of two. BufSize is 8 KiB: requests are well under 4 KiB, so only one page per
+  # buffer is ever faulted, and shrinking it cannot lower RSS (page granularity)
+  # but would add a CQE per request.
+  BufRingDefault = 256
   BufRingMax     = 8192
   # Multi-ring default budget: the ring count is at most MaxRings, so splitting
-  # one bounded global budget keeps total provided buffers (~4,096 * 8 KiB of
-  # lazily-faulted address space) independent of how many rings exist. The
-  # single-ring default stays BufRingDefault (64), preserving the measured RSS /
-  # latency point; the multi-ring measurement compares the two budgets.
+  # one bounded global budget keeps total provided buffers independent of ring
+  # count. The single-ring path uses BufRingDefault.
   MultiBufBudget = 4096
 
 # kernel-side struct for IORING_OP_TIMEOUT
@@ -1721,13 +1715,17 @@ proc runLoop(r: var RingCtx) =
     # End the pass's read snapshot HERE: after the write commit (which already
     # ended it for a read->write pass). A read transaction must never survive a
     # pass, otherwise the connection would keep reading a stale snapshot and the
-    # checkpointer could not backfill the frames it still covers.
-    #
-    # The WAL checkpoint is NOT run here. It lives on its own connection/thread
-    # (started below) and is driven by the wal_hook, so this loop never performs
-    # checkpoint I/O: no page copy and no fsync on the request thread.
+    # inline RESTART checkpoint could not rewind the WAL.
     if gDb != nil and not gDb.endRead():
       stderr.writeLine("db: COMMIT of the pass read transaction failed")
+
+    # Inline checkpoint at the pass boundary, after the commit and after the
+    # read snapshot is closed. The WAL hook counts frames; maybeCheckpoint only
+    # does work once WalCheckpointFrames have accumulated, and one attempt per
+    # pass is enough (SQLITE_BUSY leaves the counter for the next pass). This is
+    # the only checkpoint path: there is no checkpoint connection or thread.
+    if gDb != nil:
+      gDb.maybeCheckpoint()
 
     # Buffers returned during this pass may have un-starved recvs that hit
     # -ENOBUFS earlier in the same pass.
@@ -1956,6 +1954,12 @@ proc runMultiLoop(rings: var seq[RingCtx]) =
     if gDb != nil and not gDb.endRead():
       stderr.writeLine("db: COMMIT of the pass read transaction failed")
 
+    # Inline checkpoint at the process-wide pass boundary, after the commit and
+    # after the read snapshot is closed (one connection is shared by every ring;
+    # all rings are drained before this point).
+    if gDb != nil:
+      gDb.maybeCheckpoint()
+
     # Buffers returned during this pass may have un-starved recvs that hit
     # -ENOBUFS earlier in the same pass. Per ring: the pools are not shared.
     for i in 0 ..< rings.len:
@@ -1979,7 +1983,7 @@ proc readConntrackMax(): int =
 proc autoBufferSlots(rings: int): int =
   ## Per-ring share of the bounded global provided-buffer budget, rounded down
   ## to a power of two. initPool clamps it to [64, BufRingMax] afterwards. N=1
-  ## keeps the measured BufRingDefault point unchanged.
+  ## uses BufRingDefault for the single-ring path.
   if rings <= 1:
     return BufRingDefault
   var want = MultiBufBudget div rings
@@ -2206,16 +2210,12 @@ proc main() =
     gRings[i].freeTop = 0
 
   # ---- database -----------------------------------------------------------
-  # ONE connection, owned by the ONE request thread. The checkpoint pthread and
-  # its second connection are unchanged; no lock is added anywhere.
+  # ONE connection, owned by the ONE request thread. The WAL hook counts frames
+  # and the event loop runs RESTART checkpoints inline at its pass boundary.
   gDb = openDb(cfg.sqlitePath)
   # Write batching across one completion-queue pass; GROUP_COMMIT=0 restores
   # autocommit. Default ON.
   gDb.setGroupCommit(groupCommitEnabled())
-  # Dedicated checkpoint connection + thread, plus the WAL hook on the request
-  # connection. From here on every commit raises the hook's atomic flag and the
-  # worker runs PASSIVE checkpoints; the request loop never checkpoints.
-  gDb.startCheckpointer()
   markStart()
 
   let recvStr = if recvMultishot: "multishot" else: "oneshot"

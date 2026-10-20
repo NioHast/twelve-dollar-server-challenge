@@ -395,9 +395,8 @@ const SimpleEscape = {'b', 'f', 'n', 'r', 't', 'v', '\\', '"', '\'', '/'}
 
 proc decodeSub(js: var JsonScan; a, b: int; value: var int64): bool =
   ## Decode an already-validated JSON string raw span and accept it only if the
-  ## decoded form is one-or-more ASCII digits fitting int64 (the old
-  ## parsePositiveInt64). Escaped digits (\u0031) count; escapes that produce
-  ## any other char make the sub invalid.
+  ## decoded form is one-or-more ASCII digits fitting int64. Escaped digits
+  ## (\u0031) count; escapes that produce any other char make the sub invalid.
   value = 0
   var seen = false
   var i = a

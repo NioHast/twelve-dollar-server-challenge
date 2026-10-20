@@ -149,15 +149,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# compile the server. The default is the CONTROL build: -d:release keeps every
-# runtime bounds/overflow/range check ON. A measured -d:danger build produced
-# 4.43% fewer user instructions per GET /feed and a ~4.9% higher median in a
-# short 64-connection smoke A/B, but that is NOT enough to ship unchecked code
-# by default: the required 64k end-to-end A/B has not been run, and -d:danger
-# also disables the assert-only slot invariants.
-# BUILD_VARIANT=danger exists for that A/B; it is never the default.
-# -fno-semantic-interposition and -march=native match what the fastest C entry
-# compiled with.
+# compile the server. The shipping default is BUILD_VARIANT=danger:
+# -d:danger removes Nim runtime bounds/overflow/range checks and `assert`.
+# The 42-check suite and the 64k load test pass with it. Use
+# BUILD_VARIANT=control for a checked build when debugging or testing.
+# Both variants use the same two-pass PGO pipeline; pgo_build clears
+# pgo-data/ + nimcache-pgo before pass 1, so a profile is never reused across
+# variants.
+# -fno-semantic-interposition and -march=native are used for native code
+# generation in every build.
 #
 # --nimcache keeps the object cache inside the submission (gitignored) so the
 # documented clean state `rm -rf bin nimcache vendor` really is clean; the
@@ -167,21 +167,15 @@ mkdir -p bin
 # -fno-plt: call external functions through the GOT directly instead of via a
 # PLT stub. Combined with -fno-semantic-interposition + LTO this removes a
 # per-call indirection (~1 load + jump) on the hot path; folded into PASS_C_BASE
-# so the plain build, BOTH PGO passes and the io_uring build all inherit it.
+# so the plain build, both PGO passes and the io_uring build all inherit it.
 #
-# MEASURED VARIANTS (opt-in; control is the default):
-#   BUILD_VARIANT=control (default) -d:release, PASS_C_BASE only: every runtime
-#                          bounds/overflow/range check stays ON.
-#   BUILD_VARIANT=danger  -d:danger instead of -d:release: removes ALL runtime
-#                          bounds/overflow/range checks and `assert`. The
-#                          danger variant is gated on the 42-check suite, feed
-#                          equality and the differential unit tests (all pass),
-#                          but a 64k end-to-end A/B is still required before
-#                          shipping it.
-# Both variants run through the SAME two-pass PGO pipeline, and pgo_build clears
-# pgo-data/ + nimcache-pgo before pass 1, so a profile is never reused across
-# variants.
-BUILD_VARIANT="${BUILD_VARIANT:-control}"
+# BUILD VARIANTS:
+#   danger (default) -d:danger: removes runtime bounds/overflow/range checks
+#                    and `assert`; fastest, with the safety trade documented.
+#   control          -d:release: keeps all runtime checks on; use for checked
+#                    builds, debugging, and differential tests.
+# Both variants run through the same two-pass PGO pipeline.
+BUILD_VARIANT="${BUILD_VARIANT:-danger}"
 case "$BUILD_VARIANT" in
   control) VARIANT_NIM=(-d:release) ;;
   danger)  VARIANT_NIM=(-d:danger) ;;

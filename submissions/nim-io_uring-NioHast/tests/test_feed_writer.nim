@@ -2,13 +2,13 @@
 ##
 ## `writeFeedJson` (dense direct writer with the ordered-query decline path) and
 ## `writeFeedFallbackJson` (the ordered query, serialized directly) are both
-## compared against the OLD serialization:
+## compared against the scalar serialization:
 ##
 ##     ordered feed rows -> Post objects (getPost) -> per-byte scalar escaper
 ##
-## The old scalar escaper and the feed envelope below are test-only copies of the
-## previous implementation, so a shared bug in the new raw-span escaper cannot
-## hide. Expected row order is computed independently from the scenario's
+## The scalar escaper and the feed envelope below are test-only copies, so a
+## shared bug in the SSE2 raw-span escaper cannot hide. Expected row order is
+## computed independently from the scenario's
 ## (id, created_at) list, never from the production feed query.
 ##
 ## Matrix: empty / 1 / 19 / 20 / 21 rows, dense and non-dense id windows,
@@ -30,7 +30,7 @@ const Hex = "0123456789abcdef"
 # ---------------------------------------------------------------------------
 # Test-only scalar serialization: exactly the object serializer/addEscaped bytes.
 # ---------------------------------------------------------------------------
-proc oldEscaped(buf: var string, s: string) =
+proc scalarEscaped(buf: var string, s: string) =
   for c in s:
     case c
     of '"':  buf.add "\\\""
@@ -49,15 +49,15 @@ proc oldEscaped(buf: var string, s: string) =
       else:
         buf.add c
 
-proc oldWritePost(buf: var string, p: Post) =
+proc scalarWritePost(buf: var string, p: Post) =
   buf.add "{\"id\":"
   buf.add $p.id
   buf.add ",\"body\":\""
-  oldEscaped(buf, p.body)
+  scalarEscaped(buf, p.body)
   buf.add "\",\"created_at\":\""
-  oldEscaped(buf, p.createdAt)
+  scalarEscaped(buf, p.createdAt)
   buf.add "\",\"author\":\""
-  oldEscaped(buf, p.author)
+  scalarEscaped(buf, p.author)
   buf.add "\",\"like_count\":"
   buf.add $p.likeCount
   buf.add "}"
@@ -143,9 +143,9 @@ proc insertLike(userId, postId: int64) =
   discard sqlite3_finalize(stmt)
 
 proc orderedExpected(db: Db, buf: var string) =
-  ## The old feed serialization: independently sorted scenario rows, fetched as
+  ## The scalar feed serialization: independently sorted scenario rows, fetched as
   ## Post objects through getPost (which drops a row whose user is missing, just
-  ## like the production JOIN), then written with the old per-byte escaper.
+  ## like the production JOIN), then written with the per-byte scalar escaper.
   var ordered = scenarioPosts
   ordered.sort(proc(a, b: ScenarioPost): int =
     result = cmp(b.createdAt, a.createdAt)
@@ -158,7 +158,7 @@ proc orderedExpected(db: Db, buf: var string) =
     if not db.getPost(sp.id, p):
       continue
     if emitted > 0: buf.add ','
-    oldWritePost(buf, p)
+    scalarWritePost(buf, p)
     inc emitted
   buf.add "]}"
 
@@ -211,8 +211,8 @@ proc runScenario(name: string, setup: proc(h: ptr Sqlite3)) =
 
   echo "# scenario ", name, ": rows=", scenarioPosts.len,
        " expected-bytes=", want.len, " path=", pathKind()
-  compare(name & ".writeFeedJson_vs_old", want, actual)
-  compare(name & ".ordered_vs_old", want, ordered)
+  compare(name & ".writeFeedJson_vs_scalar", want, actual)
+  compare(name & ".ordered_vs_scalar", want, ordered)
 
 # ---------------------------------------------------------------------------
 # Scenarios (all inserts happen on a raw connection before openDb).

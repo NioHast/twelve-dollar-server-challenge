@@ -103,7 +103,7 @@ proc spanFindChar*(buf: openArray[char]; s: Span; c: char; fromRel = 0): int {.i
   -1
 
 proc spanContainsIgnoreCase*(buf: openArray[char]; s: Span; lit: string): bool =
-  ## ASCII case-insensitive substring search (the old `toLowerAscii.contains`).
+  ## ASCII case-insensitive substring search over the span.
   if lit.len == 0: return true
   if s.len < lit.len: return false
   let last = s.len - lit.len
@@ -151,10 +151,9 @@ const
   ResponseEnd = "\r\n\r\n"
 
 proc formatStatusLine(dst: var array[64, char]; status: int): int =
-  ## Write `HTTP/1.1 <status> <reason>` (the old `"HTTP/1.1 " & $status & " " &
-  ## reasonPhrase(status)`) into the stack array; returns its length. `$status`
-  ## would allocate a temp string, so the digits are written directly, using
-  ## uint64 magnitude so `low(int)` cannot overflow.
+  ## Write `HTTP/1.1 <status> <reason>` into the stack array; returns its length.
+  ## `$status` would allocate a temp string, so the digits are written directly,
+  ## using uint64 magnitude so `low(int)` cannot overflow.
   var n = 0
   template put(lit: string) =
     for c in lit:

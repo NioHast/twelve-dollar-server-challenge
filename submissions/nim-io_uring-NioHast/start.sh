@@ -7,4 +7,7 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# 256 is the shipping default; the env var remains available for tuning.
+export IOURING_BUFS="${IOURING_BUFS:-256}"
+
 exec "$DIR/bin/server"

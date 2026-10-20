@@ -1,6 +1,6 @@
 ## bench_escape.nim: same-process throughput comparison for JSON escaping.
 ##
-## The OLD run-based scalar implementation is reproduced here (test-only oracle),
+## The run-based scalar implementation is reproduced here (test-only oracle),
 ## alongside the production SSE2 `addEscaped`. Both run over the SAME corpus in
 ## the SAME process, in alternating rounds, so cache/CPU state is shared and the
 ## ratio is meaningful.
@@ -17,8 +17,8 @@ import ../src/jsonbuf
 const Hex = "0123456789abcdef"
 
 # ---------------------------------------------------------------------------
-# OLD implementation (test-only reference): per-byte membership test, bulk copy
-# of clean runs. Identical logic to the scalar production code.
+# Scalar baseline for the benchmark: per-byte membership test, bulk copy of
+# clean runs. Same logic as the scalar production code.
 # ---------------------------------------------------------------------------
 const Escaped = block:
   var s: set[char]
@@ -28,21 +28,21 @@ const Escaped = block:
     s.incl char(i)
   s
 
-proc oldAddChars(buf: var string, src: openArray[char]) {.inline.} =
+proc scalarAddChars(buf: var string, src: openArray[char]) {.inline.} =
   if src.len == 0:
     return
   let base = buf.len
   buf.setLen(base + src.len)
   copyMem(addr buf[base], unsafeAddr src[0], src.len)
 
-proc oldAddEscaped(buf: var string, s: string) =
+proc scalarAddEscaped(buf: var string, s: string) =
   var runStart = 0
   var i = 0
   while i < s.len:
     let c = s[i]
     if c in Escaped:
       if i > runStart:
-        buf.oldAddChars s.toOpenArray(runStart, i - 1)
+        buf.scalarAddChars s.toOpenArray(runStart, i - 1)
       case c
       of '"':  buf.add "\\\""
       of '\\': buf.add "\\\\"
@@ -59,7 +59,7 @@ proc oldAddEscaped(buf: var string, s: string) =
       runStart = i + 1
     inc i
   if s.len > runStart:
-    buf.oldAddChars s.toOpenArray(runStart, s.len - 1)
+    buf.scalarAddChars s.toOpenArray(runStart, s.len - 1)
 
 # ---------------------------------------------------------------------------
 # Deterministic corpus
@@ -108,19 +108,19 @@ proc makeCorpus(count: int): seq[string] =
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
-proc benchOld(corpus: seq[string], reps: int): (int64, int) =
+proc benchScalar(corpus: seq[string], reps: int): (int64, int) =
   var buf = newStringOfCap(1024)
   var sink = 0
   let t0 = getMonoTime()
   for _ in 0 ..< reps:
     for s in corpus:
       buf.setLen(0)
-      buf.oldAddEscaped s
+      buf.scalarAddEscaped s
       sink += buf.len
   let t1 = getMonoTime()
   ((t1 - t0).inNanoseconds, sink)
 
-proc benchNew(corpus: seq[string], reps: int): (int64, int) =
+proc benchSSE2(corpus: seq[string], reps: int): (int64, int) =
   var buf = newStringOfCap(1024)
   var sink = 0
   let t0 = getMonoTime()
@@ -151,40 +151,40 @@ proc main() =
   # Byte-equality guard: timing must compare identical work.
   for idx, s in corpus:
     var a, b: string
-    a.oldAddEscaped s
+    a.scalarAddEscaped s
     addEscaped(b, s)
     doAssert a == b, "byte mismatch at corpus index " & $idx
 
   # Warm up both implementations.
-  discard benchOld(corpus, 3)
-  discard benchNew(corpus, 3)
+  discard benchScalar(corpus, 3)
+  discard benchSSE2(corpus, 3)
 
-  var bestOld = high(int64)
-  var bestNew = high(int64)
+  var bestScalar = high(int64)
+  var bestSSE2 = high(int64)
   var sink = 0
   for round in 0 ..< 5:
     # Alternate order so frequency/thermal drift does not systematically favour
     # either implementation.
-    let (tOld, sOld) = benchOld(corpus, reps)
-    let (tNew, sNew) = benchNew(corpus, reps)
-    sink += sOld + sNew
-    if tOld < bestOld: bestOld = tOld
-    if tNew < bestNew: bestNew = tNew
-    echo "# round ", round + 1, ": old ", tOld div 1_000_000, " ms, new ",
-         tNew div 1_000_000, " ms"
+    let (tScalar, sScalar) = benchScalar(corpus, reps)
+    let (tSSE2, sSSE2) = benchSSE2(corpus, reps)
+    sink += sScalar + sSSE2
+    if tScalar < bestScalar: bestScalar = tScalar
+    if tSSE2 < bestSSE2: bestSSE2 = tSSE2
+    echo "# round ", round + 1, ": scalar ", tScalar div 1_000_000, " ms, sse2 ",
+         tSSE2 div 1_000_000, " ms"
 
   let calls = float(reps) * float(corpus.len)
   let totalPerRound = float(totalBytes) * float(reps)
-  let oldMBs = totalPerRound * 1000.0 / float(bestOld)
-  let newMBs = totalPerRound * 1000.0 / float(bestNew)
-  let oldNs = float(bestOld) / calls
-  let newNs = float(bestNew) / calls
+  let scalarMBs = totalPerRound * 1000.0 / float(bestScalar)
+  let sse2MBs = totalPerRound * 1000.0 / float(bestSSE2)
+  let scalarNs = float(bestScalar) / calls
+  let sse2Ns = float(bestSSE2) / calls
 
-  echo "old  : ", formatFloat(oldMBs, ffDecimal, 1), " MB/s  ",
-       formatFloat(oldNs, ffDecimal, 2), " ns/call"
-  echo "swar : ", formatFloat(newMBs, ffDecimal, 1), " MB/s  ",
-       formatFloat(newNs, ffDecimal, 2), " ns/call"
-  echo "ratio: ", formatFloat(newMBs / oldMBs, ffDecimal, 2), "x"
+  echo "scalar: ", formatFloat(scalarMBs, ffDecimal, 1), " MB/s  ",
+       formatFloat(scalarNs, ffDecimal, 2), " ns/call"
+  echo "sse2  : ", formatFloat(sse2MBs, ffDecimal, 1), " MB/s  ",
+       formatFloat(sse2Ns, ffDecimal, 2), " ns/call"
+  echo "ratio: ", formatFloat(sse2MBs / scalarMBs, ffDecimal, 2), "x"
   echo "BENCH sink=", sink
 
 main()

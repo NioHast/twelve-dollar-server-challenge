@@ -5,10 +5,10 @@ code with understanding. See the [README](../README.md) for the quick start.
 
 ## Shape of the system
 
-One process. One request thread. One io_uring event loop, plus a dedicated WAL-checkpoint thread.
+One process. One request thread. One io_uring event loop. One SQLite connection.
 HTTP/1.1 is served directly on `:80`/`:3000` (no reverse proxy) and every read and write goes to
-**SQLite** linked in-process. The checkpointer owns a second SQLite connection and never handles a
-request.
+**SQLite** linked in-process. The same connection runs the inline RESTART checkpoint at the
+process-wide pass boundary.
 
 ```
         io_uring completion queue
@@ -26,7 +26,7 @@ request.
           │   │
    jwt.nim│   │jsonbuf.nim  byte-level JSON writer
           ▼   ▼
-        db.nim ── sqlite3.nim (raw C API) ── vendored SQLite (WAL)
+        db.nim ── sqlite3.nim (raw C API) ── vendored SQLite (WAL, one connection)
                  │
                  ▼
         one SEND per drained output buffer (backpressure / registered-fd send)
@@ -36,22 +36,21 @@ request.
 
 The benchmark box has one vCPU. Extra request threads add context switches, cache
 pressure and latency jitter without adding throughput, so the whole server is a
-single thread driving 1..5 io_uring rings. This also removes all shared state
-between request handlers, which is what lets the rest of the code stay simple:
-no locks, no per-request object graph, no worker hand-off. More rings add
-connection capacity, not CPU parallelism. The only other thread is the WAL
-checkpointer, which touches its own connection and no request state.
+single thread driving 1..5 io_uring rings. This also removes shared state between
+request handlers, which is what lets the rest of the code stay simple: no locks,
+no per-request object graph, no worker hand-off. More rings add connection
+capacity, not CPU parallelism. The single SQLite connection is owned by that same
+thread.
 
 ## Modules
 
 | File | Responsibility |
 |---|---|
-| `src/server.nim` | the `io_uring` transport and the socket scaffold: multishot accept/recv, provided-buffer pool, registered fds, group commit, plus `raiseNofile`, listening-socket setup and the `processRequests` loop |
+| `src/server.nim` | the `io_uring` transport and the socket scaffold: multishot accept/recv, provided-buffer pool, registered fds, group commit, pass-boundary checkpoint call, plus `raiseNofile`, listening-socket setup and the `processRequests` loop |
 | `src/http.nim` | transport-agnostic HTTP/1.1 request parsing + response framing |
 | `src/iouring.nim` | self-contained raw `io_uring` bindings (no liburing) |
 | `src/api.nim` | routing + the five endpoints + exact error semantics |
-| `src/db.nim` | all SQL; prepared statements; pragmas; read/write lifecycle; checkpoint connection wiring |
-| `src/checkpoint.nim` | WAL checkpointer: raw `pthread_create`, eventfd wakeup, coalesced PASSIVE checkpoints |
+| `src/db.nim` | all SQL; prepared statements; pragmas; read/write lifecycle; inline WAL checkpoint |
 | `src/sqlite3.nim` | minimal raw `{.importc.}` bindings to the vendored SQLite C API |
 | `src/jwt.nim` | base64url + HS256 (nimcrypto), constant-time compare |
 | `src/jsonbuf.nim` | byte-level JSON writing and minimal request-body parsing |
@@ -77,7 +76,8 @@ API.
    served-then-closed (see *Bounds*).
 3. **parse**: the buffer is walked with a cursor (no per-request front delete).
    Headers, method, path, `Authorization`, `Content-Length` and `Connection` are
-   extracted in place. Malformed / non-conforming framing → `400` + close.
+   extracted in place. Malformed or non-conforming framing returns `400` and
+   closes.
 4. **route + auth**: `api.handleRequest`. On authenticated routes the bearer
    token is verified **before** the id is parsed, so `POST /posts/abc/like`
    without a token is `401`, not `400`.
@@ -86,14 +86,17 @@ API.
    every read in that pass runs inside it, and the server COMMITs it
    (`endRead`) at the pass boundary, after the write batch commit. Individual
    statements are reset after use so none is left active; the reset does not end
-   the pass's read transaction. The WAL checkpoint is not part of this pass: it
-   runs on its own connection and thread.
+   the pass's read transaction. After the pass commit and `endRead`, the loop
+   calls `maybeCheckpoint`, which runs one inline `SQLITE_CHECKPOINT_RESTART`
+   when the WAL hook has counted at least 4096 frames.
 6. **respond**: the response is appended to the output buffer and a send is
-   submitted. `GET /feed` is special: `db.writeFeedResponse` writes the head and
-   body directly into the pooled output buffer with a 128-byte head reserve, so
-   the feed body never exists as a separate Nim string. (A single SQLite
-   `json_object`/`json_group_array` statement is not used because it was
-   1.78-2.00x slower than this writer.) If the response cannot be
+   submitted. `GET /feed` is special: the top-20 ids come from the `created_at`
+   index, likes are counted inside that id window, and the rows are fetched with
+   a plain rowid range, `id BETWEEN ? AND ?`, with no `ORDER BY` or `INDEXED BY`.
+   Each row is written into the reusable `feedScratch` buffer at its feed slot,
+   then the slots are reassembled in feed order and copied into the pooled
+   output buffer with `copyMem`. The feed body never exists as a separate Nim
+   string and no per-row temporary string is built. If the response cannot be
    sent in full, it stays buffered and the send is re-submitted until the socket
    accepts it.
 7. **keep-alive**: unless `Connection: close`, the connection stays open; the 1 s
@@ -116,6 +119,11 @@ These are the rules that make the completion loop correct:
   ring with a blocking wait while another ring could have completions. Each
   ring is entered non-blocking (`min_complete = 0`) and the loop sleeps in one
   `epoll_wait` on a shared eventfd registered on every ring.
+- **Pass-boundary checkpoint.** The WAL hook only records the frame count. After
+  the pass commit and `endRead`, with every statement reset and no transaction
+  open, `maybeCheckpoint` runs one `SQLITE_CHECKPOINT_RESTART` when the count is
+  at least 4096. A busy result leaves the count in place for a later pass. The
+  checkpoint never runs inside an open read transaction.
 - **Backpressure on send.** A partial send keeps the remainder buffered and
   re-submits the send, so an already-writable socket is never missed.
 - **Free the fixed-file slot before reusing it**, and guard double-close with an
@@ -150,13 +158,14 @@ the server's control:
   one ring. When the limits rise, up to 5 rings each register their own table (about 327k fixed slots)
   and each binds its own `SO_REUSEPORT` listener on the same host:port. Every ring has a `RingCtx`,
   and every CQE's `user_data` carries the ring id; slots are per-ring and never cross between rings.
-  `NIM_RINGS` and `NIM_SLOTS_PER_RING` are the only overrides (clamped) for operational A/B tests.
+  `NIM_RINGS` and `NIM_SLOTS_PER_RING` are the only tuning overrides (clamped).
 - **Large listen backlog** (4096) for reconnect bursts.
 - **EMFILE backoff**: on an `accept` failure the acceptor is paused and retried on the next 1 s tick;
   it never accept-spins.
 - **io_uring registered fds (default)**: sockets in the fixed-file table hold no new process fd.
 - **Provided-buffer receive pool (default)**: multishot recv draws from a shared, lazily-faulted pool
-  (64 buffers of 8 KiB), so idle connections hold no recv buffer.
+  (256 buffers of 8 KiB by default; `IOURING_BUFS` overrides the size), so idle connections hold no
+  recv buffer.
 - **Age-based sweep.** A 1 s sweep (driven by the io_uring timeout) closes a connection that has been
   idle for 75 s or stalled mid-request for 30 s, keeping the open-connection count bounded over a long
   run.
@@ -214,21 +223,22 @@ on a kernel without `IORING_RECV_MULTISHOT`, run with `IOURING_RECV=oneshot`.
 
 - Vendored amalgamation, compiled in-tree (`vendor/sqlite3.c`), so there is no
   system `libsqlite3` dependency.
-- **Two connections, one per thread.** The request connection serves every
-  request; the checkpoint connection is owned by the checkpoint pthread. The
-  library is compiled `SQLITE_THREADSAFE=2` (multi-thread mode), and each
-  connection is opened `SQLITE_OPEN_READWRITE|NOMUTEX`, which is correct because
-  no connection is ever used by two threads. Statements on the request
-  connection are prepared once with `SQLITE_PREPARE_PERSISTENT`; the checkpoint
-  connection runs only its one-time schema prime, the `journal_size_limit` PRAGMA, and the checkpoint API calls.
-- **Feed scan.** `GET /feed` first reads the top-20 ids in feed order
-  (`ORDER BY created_at DESC, id DESC LIMIT 20`). When the ids fit a dense window
-  (`maxId - minId < 256`), likes and rows are read by id range; `SqlFeedRows`
-  carries `WHERE p.id BETWEEN ? AND ?` with `minId`/`maxId` bound, matching the
-  bounded `feed_rows` shape. If the window is too sparse, a row is
-  missing, or the order drifts, the original ordered query with the correlated
-  like count runs verbatim. This is a scan strategy, not a cache: no rows survive
-  the request.
+- **One connection, one thread.** The request connection serves every request and
+  also runs the inline checkpoint. The library is compiled `SQLITE_THREADSAFE=0`
+  (single-thread mode) with `HAVE_FDATASYNC=1`, and the inline checkpoint runs on that
+  same connection. Statements are prepared once with `SQLITE_PREPARE_PERSISTENT`.
+- **`locking_mode=EXCLUSIVE`.** With exactly one connection in the process there is
+  no other reader to coordinate with, so EXCLUSIVE skips per-statement shared-lock
+  traffic and makes WAL reset deterministic. The database is held exclusively
+  while the server runs: no other process or connection can open it.
+- **Feed scan.** `GET /feed` first reads the top-20 ids through the `created_at`
+  index (`ORDER BY created_at DESC, id DESC LIMIT 20`). Likes are counted inside
+  that id window. Rows are then read with a plain rowid range,
+  `id BETWEEN ? AND ?`, with no `ORDER BY` or `INDEXED BY`, and each row is
+  written into the reusable `feedScratch` buffer at its feed slot. The slots are
+  reassembled in feed order and copied into the response with `copyMem`. A sparse
+  id window declines to the ordered feed query, so the output stays exact. This
+  is a scan strategy, not a cache: no rows survive the request.
 - **No application-level cache.** Every request reads SQLite on the request
   connection. There is no response cache, query cache, or in-memory copy of
   posts, likes, or users; the only state reused across requests is SQLite's page
@@ -237,35 +247,25 @@ on a kernel without `IORING_RECV_MULTISHOT`, run with `IOURING_RECV=oneshot`.
 - Pragmas on the request connection: `journal_mode=WAL`, `synchronous=NORMAL`,
   `busy_timeout=5000`, `foreign_keys=ON`, `temp_store=MEMORY`,
   `cache_size=-64` (64 KiB), `mmap_size=1 GiB` (`SQLITE_MMAP_SIZE`),
-  `wal_autocheckpoint=0`, `journal_size_limit=67108864`, `locking_mode=NORMAL`.
-  `NORMAL` (not `EXCLUSIVE`) keeps the database openable by the checkpoint
-  connection. The checkpoint connection also sets `journal_size_limit=67108864`.
-- **Checkpoint lifecycle.** The request connection's `wal_hook` only raises an
-  atomic flag; it makes no SQLite call. The worker wakes on an eventfd and runs
-  one `SQLITE_CHECKPOINT_PASSIVE` per interval (1 s), coalescing a burst of
-  commits into at most one checkpoint per interval. The request loop never
-  checkpoints. RESTART and FULL are never used under load because both wait for
-  readers and block the writer. Shutdown is ordered: the hook is uninstalled
-  before the context is freed, so a later commit cannot signal freed memory, and
-  a second stop is a no-op. `checkpointStats` exposes count, last/max/total
-  duration, busy, errors, poll failures and a failed flag; only `SQLITE_BUSY`
-  counts as busy, and a poll failure marks the worker failed instead of
-  disappearing silently. `test_db.nim` exercises commit-after-start,
-  write-after-stop, stop with a checkpoint still queued, and a concurrent
-  reader/writer.
-- **WAL-growth trade-off.** PASSIVE never blocks the writer, but it cannot reset
-  the WAL while a saturated writer keeps the log ahead of it. At a saturated 64k
-  mixed load the WAL grows about 140 MiB per minute (measured maxima ~143-225 MiB
-  in 60 s); 32k paced settles at the 64 MiB `journal_size_limit`, and a feed-only
-  64k run stays around 6.6 MiB. Budget roughly 1 GiB of free disk for a 5-minute
-  64k hold. This costs disk headroom, not durability or memory: each commit is
-  still durable before its response.
-- Durability: a write is committed before its response is sent; `NORMAL` survives
-  a process crash and never corrupts the file.
+  `wal_autocheckpoint=0`, `journal_size_limit=67108864`, `locking_mode=EXCLUSIVE`.
+- **Inline checkpoint lifecycle.** The request connection's `wal_hook` only records
+  the WAL's new total frame count; it makes no SQLite call, allocation or wakeup.
+  After the pass COMMIT and after `endRead` has closed the read snapshot, with
+  every statement reset, the loop calls `maybeCheckpoint`. It runs one
+  `SQLITE_CHECKPOINT_RESTART` when the count is at least 4096 frames. RESTART
+  copies every frame back into the database and rewinds the WAL to frame 0, so the
+  file is reused instead of growing. The count resets only on success; on
+  `SQLITE_BUSY` it stays in place and the next pass retries. FULL and TRUNCATE are
+  never used. The WAL stays around 16 MiB at the current 64k mixed load.
+- **Durability.** A write is committed before its response is sent; `NORMAL`
+  survives a process crash and never corrupts the file. A 3,000-post SIGTERM and
+  reopen check confirmed that committed rows survive the restart.
 
 ## Robustness and bounds
 
 See the "Robustness & bounds" section of the [README](../README.md). In short:
-no request can abort the process (all handler exceptions, including `Defect`s,
-become `500`), framing is strict, input and output are bounded, and parsing is
-O(n).
+handler exceptions become `500`, framing is strict, input and output are bounded,
+and parsing is O(n). The shipping build is `-d:danger`, which removes Nim bounds,
+overflow and range checks and `assert`; the 42-check suite and the 64k load test
+pass, and malformed-input fuzzing is advisable. `BUILD_VARIANT=control` opts into
+a checked `-d:release` build.

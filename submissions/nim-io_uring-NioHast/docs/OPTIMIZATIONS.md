@@ -10,7 +10,7 @@ This document describes the performance design of the server, including build-ti
 | One request thread | A single event loop handles all sockets, so there is no worker pool, thread hand-off, or per-request thread scheduling. | `src/server.nim` |
 | io_uring transport | Networking uses completion-based io_uring operations instead of an epoll plus read/write loop. | `src/iouring.nim`, `src/server.nim` |
 | Multishot recv | One receive operation stays armed across many completions, reducing submission overhead. | `src/server.nim` |
-| Provided-buffer ring | A registered buffer ring supplies receive buffers, so a recv does not allocate or copy a new buffer each time. | `src/server.nim`, `src/iouring.nim` |
+| Provided-buffer ring | A registered buffer ring supplies receive buffers, so a recv does not allocate or copy a new buffer each time. The default pool is 256 buffers of 8 KiB; `IOURING_BUFS` overrides it within the clamp. | `src/server.nim`, `src/iouring.nim` |
 | Direct request parsing | Complete requests are parsed and served in place from the provided receive buffer, including pipelined requests in one buffer. Only an incomplete request is copied into the connection input buffer. | `src/server.nim`, `src/http.nim` |
 | Multishot accept | One accept operation serves a stream of incoming connections instead of re-arming after every accept. | `src/server.nim` |
 | Direct accept | The kernel allocates a fixed-file slot for each accepted connection, avoiding a per-accept registration syscall. | `src/server.nim` |
@@ -40,31 +40,32 @@ This document describes the performance design of the server, including build-ti
 |---|---|---|
 | WAL mode | Readers use a snapshot while one writer appends to the WAL, so reads and writes do not block each other. | `src/db.nim` |
 | `synchronous=NORMAL` | Avoids a full fsync on every commit while keeping the database consistent. | `src/db.nim` |
+| `locking_mode=EXCLUSIVE` | With one connection in the process, skips shared-lock traffic and makes WAL reset deterministic; no other process or connection can open the database while the server runs. | `src/db.nim` |
 | `busy_timeout=5000` | Bounds how long a statement waits for a lock instead of failing immediately. | `src/db.nim` |
-| `foreign_keys=ON` | Enforces the schema's referential integrity on every connection. | `src/db.nim` |
+| `foreign_keys=ON` | Enforces the schema's referential integrity. | `src/db.nim` |
 | `temp_store=MEMORY` | Keeps temporary B-trees in memory instead of writing them to disk. | `src/db.nim` |
 | `cache_size=-64` | Keeps SQLite's own page cache small and relies on the OS page cache for database pages. | `src/db.nim` |
 | `mmap_size=1 GiB` | Maps the main database file so reads can come from the OS page cache without a copy. | `src/db.nim` |
 | `journal_size_limit=64 MiB` | Caps how much WAL space is retained after a checkpoint. | `src/db.nim` |
-| `wal_autocheckpoint=0` | SQLite does not checkpoint on the request thread; the checkpoint worker owns that work. | `src/db.nim` |
-| Off-loop PASSIVE checkpoint | A separate SQLite connection and pthread copy the WAL, so the request loop never performs a checkpoint. | `src/checkpoint.nim` |
-| Coalesced checkpoint signals | Commits only wake the worker; the worker coalesces work to at most one checkpoint per second. | `src/checkpoint.nim`, `src/db.nim` |
-| Raw-pthread worker | The worker uses a Nim pthread with atomics and stack buffers, avoiding the Nim runtime on the worker thread. | `src/checkpoint.nim` |
+| `wal_autocheckpoint=0` | SQLite does not checkpoint automatically; the request loop decides when to run the inline RESTART checkpoint. | `src/db.nim` |
+| Inline RESTART checkpoint | The WAL hook records the frame count. At the process-wide pass boundary, after the pass COMMIT and `endRead`, the single connection runs one `SQLITE_CHECKPOINT_RESTART` when the count is at least 4096 frames, rewinding the WAL so it stays around 16 MiB. | `src/db.nim`, `src/server.nim` |
+| Busy-safe checkpoint retry | On `SQLITE_BUSY` the frame count is left in place and the next pass retries once; the checkpoint never spins inside a pass. | `src/db.nim` |
 | Persistent prepared statements | SQL is parsed once with `SQLITE_PREPARE_PERSISTENT`, so the hot path reuses prepared statements. | `src/db.nim` |
-| QPSG | Query-plan stability is enabled so a re-prepared statement keeps the intended plan. | `src/db.nim`, `src/sqlite3.nim` |
+| QPSG | QPSG keeps a re-prepared statement stable. | `src/db.nim`, `src/sqlite3.nim` |
 | One read transaction per pass | All reads in an event-loop pass share one snapshot, reducing transaction and lock churn. | `src/db.nim`, `src/server.nim` |
 | Group commit | All writes in one pass share one transaction, so many requests amortise one COMMIT. | `src/db.nim`, `src/server.nim` |
 | Commit before SEND | A successful response is sent only after its transaction commits. | `src/server.nim`, `src/db.nim` |
-| Dense feed scan | The top-20 ids define a small id window; likes and rows are fetched by range instead of running a correlated count for each row. | `src/db.nim` |
-| Ordered feed fallback | If the window is sparse or rows do not line up, the original ordered query runs instead. | `src/db.nim` |
-| Direct feed writer | SQLite columns are written straight into the response buffer, with no `Post` sequence and no intermediate body string. | `src/db.nim`, `src/jsonbuf.nim` |
+| Top-20 ids plus rowid range | The top-20 ids come from the `created_at` index; likes are counted in that id window; rows are fetched with `id BETWEEN ? AND ?` with no `ORDER BY` or `INDEXED BY`. | `src/db.nim` |
+| In-memory slot reassembly | Rows arrive in rowid order, are written into their feed slot, and the slots are emitted in feed order. | `src/db.nim` |
+| Sparse-window decline | If the id window is too sparse or rows do not line up, the ordered feed query runs instead, keeping the output exact. | `src/db.nim` |
+| Feed scratch and `copyMem` | Feed rows are staged in one reusable `feedScratch` buffer, and segments are copied directly into the response with `copyMem`; there is no per-feed or per-row temporary string. | `src/db.nim`, `src/jsonbuf.nim` |
 | Direct post writer | `GET /posts/:id` serialises columns directly instead of building a `Post` object first. | `src/db.nim` |
 | Targeted `ON CONFLICT` | `ON CONFLICT(user_id, post_id) DO NOTHING` avoids a broad conflict search for duplicate likes. | `src/db.nim` |
 | Health without a read transaction | `SELECT 1` does not open the pass read transaction, so health-only passes skip BEGIN/COMMIT. | `src/db.nim` |
 | Minimal statement resets | Statements are reset only where required; redundant binding clears were removed. | `src/db.nim` |
 | Prepared transaction control | BEGIN, COMMIT, and ROLLBACK are prepared once and reused. | `src/db.nim` |
 | SQLite-only data path | Every request reads SQLite; there is no in-process response cache, query cache, or table copy to invalidate. | `src/db.nim` |
-| SQLite compile trims | Unused SQLite features are omitted and QPSG is enabled to keep the library smaller and focused. | `src/sqlite3.nim`, `build.sh` |
+| SQLite compile trims | Unused SQLite features are omitted, QPSG is enabled, and the library is compiled `SQLITE_THREADSAFE=0` with `HAVE_FDATASYNC=1` for the one-connection design. | `src/sqlite3.nim`, `build.sh` |
 
 ## HTTP, JSON, and JWT
 
@@ -93,7 +94,7 @@ This document describes the performance design of the server, including build-ti
 | Native code generation | `-O3 -march=native` targets the host CPU's instruction set. | `build.sh` |
 | Direct external calls | `-fno-semantic-interposition` and `-fno-plt` remove avoidable indirection for external calls. | `build.sh` |
 | ARC with threads off | `--mm:arc --threads:off` keeps GC and thread-runtime work out of the request path. | `build.sh` |
-| Checks retained | The default build keeps bounds and overflow checks; the unsafe variant is not used for the submission. | `build.sh` |
+| Danger build by default | The shipping build uses `-d:danger`, which removes Nim bounds, overflow and range checks and `assert`. The 42-check suite and the 64k load test pass; malformed-input fuzzing is advisable. `BUILD_VARIANT=control` opts into checked `-d:release`. | `build.sh` |
 | Parallel build | `NIM_JOBS` lets the compiler use multiple cores during the build. | `build.sh` |
 | Vendored dependencies | SQLite and nimcrypto are vendored and checksum-verified, so the build has no external service dependency. | `build.sh`, `config.nims` |
 
@@ -107,4 +108,4 @@ This document describes the performance design of the server, including build-ti
 | ENOBUFS and partial-send recovery | The loop re-arms or retries instead of dropping the connection when buffers or send space run out. | `src/server.nim` |
 | Deferred close handling | Buffered output is drained before a connection is closed. | `src/server.nim` |
 | Deferred batch rollback | Withheld responses become 500 responses if the transaction fails to commit. | `src/server.nim`, `src/db.nim` |
-| WAL startup check | Startup fails if SQLite cannot enable WAL, instead of running with checkpoint assumptions that no longer hold. | `src/db.nim` |
+| WAL startup check | Startup fails if SQLite cannot enable WAL, because the inline checkpoint design assumes a WAL database. | `src/db.nim` |

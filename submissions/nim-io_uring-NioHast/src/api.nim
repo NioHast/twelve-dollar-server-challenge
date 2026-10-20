@@ -39,10 +39,8 @@ proc parsePositiveId(buf: openArray[char]; s: Span): tuple[ok: bool, id: int64] 
   ##
   ## Overflow guard: int64 holds at most 19 decimal digits, and the check below
   ## bounds `v` against the *next* digit before multiplying, so no intermediate
-  ## `v*10 + d` can overflow. The old guard (`v > 922337203685477580`) fired one
-  ## step too late: v=922337203685477580 with d=8 or 9 overflowed and raised a
-  ## Defect that aborted the single-threaded process (both fixes below: the
-  ## `len > 19` cap and the digit-aware bound).
+  ## `v*10 + d` can overflow. The `len > 19` cap and the digit-aware bound keep
+  ## the parse total.
   if s.len == 0 or s.len > 19: return (false, 0'i64)
   var v: int64 = 0
   for i in 0 ..< s.len:

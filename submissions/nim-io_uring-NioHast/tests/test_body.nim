@@ -1,9 +1,9 @@
 ## test_body.nim: differential proof for the direct `parseBody` fast path.
 ##
-## `oldParseBody` below is the previous implementation (std/json) kept here only
-## as an oracle. For every corpus entry we require:
+## `oracleParseBody` below is the std/json oracle, kept here only for the
+## differential check. For every corpus entry we require:
 ##
-##   * new parseBody == oldParseBody in both kind and decoded bytes,
+##   * fast parseBody == oracleParseBody in both kind and decoded bytes,
 ##   * canonical entries are actually taken by the fast scanner,
 ##   * non-canonical / unsupported entries are rejected by the fast scanner, so
 ##     the std/json fallback is really exercised.
@@ -21,7 +21,7 @@ type Parsed = tuple[kind: BodyKind, body: string]
 # ---------------------------------------------------------------------------
 # Reference implementation: exactly what parseBody did before the fast path.
 # ---------------------------------------------------------------------------
-proc oldParseBody(raw: string): Parsed =
+proc oracleParseBody(raw: string): Parsed =
   var node: JsonNode
   try:
     node = parseJson(raw)
@@ -50,7 +50,7 @@ proc failDetail(name: string, got, want: Parsed) =
 
 proc check(name: string, raw: string, expectFast: bool) =
   inc checks
-  let want = oldParseBody(raw)
+  let want = oracleParseBody(raw)
   var fastBody = ""
   let fast = parseCanonicalBody(raw, fastBody)
   if fast != expectFast:

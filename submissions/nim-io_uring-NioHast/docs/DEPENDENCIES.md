@@ -12,10 +12,9 @@ what happens if it is missing. See [README](../README.md) for build/run and
 
 `ldd bin/server` shows just `libc.so.6` (plus the loader/vdso): SQLite is compiled
 in-tree, the Nim thread runtime is off, there is no `dlopen`, and libm is folded into
-glibc. The server runs one request thread plus one checkpoint thread; the
-checkpoint worker is a plain POSIX thread (`pthread_create`) implemented in
-`src/checkpoint.nim` (Nim, no C shim), which glibc provides,
-so no extra shared library appears. The binary runs on any Ubuntu 24.04.
+glibc. The server runs one request thread with one SQLite connection, and the inline
+checkpoint runs on that thread, so no POSIX pthread worker is created and no extra
+shared library appears. The binary runs on any Ubuntu 24.04.
 
 ## Build: pinned downloads (URL + sha256)
 
@@ -56,7 +55,7 @@ linked into the server. The build does not use a user Nimble directory;
 ## C headers referenced
 
 `<sys/socket.h>`, `<netinet/tcp.h>`, `<errno.h>`, `<unistd.h>`, `<sys/syscall.h>`,
-`<sys/mman.h>`, `<pthread.h>`, `<poll.h>`, `<sys/eventfd.h>`, `<emmintrin.h>` and the
+`<sys/mman.h>`, `<sys/eventfd.h>`, `<poll.h>`, `<emmintrin.h>` and the
 vendored `<sqlite3.h>`: all from glibc / `linux-libc-dev` (part of `build-essential`)
 and the vendored SQLite. The io_uring structs are hand-mirrored, so
 `<linux/io_uring.h>` is not included. No extra packages.

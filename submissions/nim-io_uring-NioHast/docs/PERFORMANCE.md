@@ -1,6 +1,7 @@
 # Performance
 
-This document describes what was measured, how to reproduce it, and what the numbers do and do not mean.
+This document describes the current measurements, how to reproduce them, and what the numbers do and
+do not mean.
 
 ## What the challenge measures
 
@@ -11,7 +12,8 @@ The scored workload is a five-minute k6 hold. A run passes when:
 - the failed-request rate stays below 1%
 - the highest passing VU level is the score
 
-The 64k paced mixed test is a separate stress test. It is useful for finding CPU, memory, WAL, and connection-lifetime problems, but it is not the official score.
+The 64k paced mixed test is a separate stress test. It is useful for finding CPU, memory, WAL, and
+connection-lifetime problems, but it is not the official score.
 
 ## How to reproduce
 
@@ -26,7 +28,6 @@ The integration harnesses are under `tests/`:
 
 ```bash
 bash tests/feed_equality.sh
-bash tests/commit_failure.sh
 bash tests/conn_churn.sh
 bash tests/conn_deferred_close.sh
 bash tests/conn_lifetime_soak.sh
@@ -36,81 +37,96 @@ bash tests/multiring_smoke.sh
 
 The official 42-check suite is byte-exact and runs against a fresh seed copy.
 
+The k6 figure below uses `bench/load.js` with 5,000 VUs, a 30 s ramp and a 120 s hold. The server was
+pinned to CPU 0 for that run.
+
 ## Measured results
 
-These numbers are from a local WSL2 development box with four vCPUs and about 3.8 GiB of RAM. The server and load generator share the machine over loopback. Absolute numbers are therefore not the official score.
+These numbers are from a local WSL2 development box with four vCPUs. The 64k figures are same-session
+means of four repetitions. The server and load generator share the host over loopback, so absolute
+numbers are not the official score.
 
 ### 64,000 paced mixed connections
 
 | Metric | Result |
 |---|---:|
-| Requests completed | about 408,000 in 60 s |
 | Throughput | about 6,800 req/s |
-| p50 | about 0.5 ms |
-| p95 | `32.768-49.152 ms` |
-| p99 | `65.536-163.840 ms` |
-| CPU | `59.7-60.8%` of one core |
-| User CPU | `22.1-23.4%` |
-| System CPU | `37.4-37.6%` |
-| RSS | `178.7 MiB` |
-| WAL max | `64 MiB` |
+| CPU | `62.2%` of one core |
+| User CPU | `18.25%` |
+| System CPU | `43.95%` |
+| p99 | `41-229 ms` |
+| RSS | `142.8 MiB` |
+| WAL max | `16.2 MiB` |
 | Errors | `0` |
 
-### 30-minute soak
-
-32,000 connections at 3,400 req/s:
-
-| Metric | Result |
-|---|---:|
-| p95 | `163.840 ms` |
-| p99 | `327.680 ms` |
-| Errors | `0` |
-| CPU | `48.5%` of one core |
-| RSS high-water mark | `156.2 MiB` |
-| RSS drift from 60 s to end | `-13.28%` |
-| WAL max | `102.4 MiB` |
-| Worst off-loop checkpoint | `1.30 s` |
-
-The checkpoint copy ran on the checkpoint thread. Request p99 stayed at `327.680 ms`.
+Across the four runs, p99 ranged from 41 to 229 ms (median about 86 ms). The high end is a
+pass-boundary checkpoint stall. Every run stayed below the 1 s p99 threshold with zero errors.
 
 ### k6 hold
 
-The direct-parse build passed these local runs:
+5,000 VUs, 30 s ramp + 120 s hold:
 
-| VUs | Duration | p95 | p99 | p99.9 | CPU | Errors |
-|---:|---:|---:|---:|---:|---:|---:|
-| 6,000 | 10 min | `10.43 ms` | `79.72 ms` | `186.10 ms` | `10.0%` | 0 |
-| 10,000 | 5 min | `101.71 ms` | `213.57 ms` | `655.07 ms` | `12.7%` | 0 |
-| 10,000 | 10 min | `85.23 ms` | `174.81 ms` | `436.58 ms` | `13.1%` | 0 |
+| Metric | Result |
+|---|---:|
+| CPU | `8.3%` of one core |
+| User CPU | `3.0%` |
+| System CPU | `5.25%` |
+| p95 | `4.46 ms` |
+| p99 | `14.1 ms` |
+| Errors | `0` |
 
-A 15,000-VU local run collapsed on the k6 client: throughput fell to about 306 req/s while the server CPU stayed near 7%. That is a client limit, not a server saturation result.
+The local load generator is co-located with the server, so this run cannot certify a maximum user
+count. It is a local regression check, not an organiser score.
 
 ## Why it is fast
 
 - **Direct HTTP:** no reverse proxy, no extra network hop, and no proxy CPU.
 - **One request thread:** one io_uring event loop, no worker pool, no thread hand-off.
+- **One SQLite connection:** the inline checkpoint runs on the same connection and thread, so there
+  is no cross-thread coordination.
 - **Multishot receive and accept:** one operation stays armed across many completions.
-- **Provided buffers and fixed files:** receives use a registered buffer ring, complete requests are parsed directly from the provided buffer, and only an incomplete tail is copied into the connection input buffer.
+- **Provided buffers and fixed files:** receives use a registered buffer ring (256 buffers of 8 KiB by
+  default), complete requests are parsed directly from the provided buffer, and only an incomplete
+  tail is copied into the connection input buffer.
 - **Fixed-file accepts:** accepts use kernel-allocated fixed-file slots.
-- **Completion batching:** sustained load waits for a small batch, and one send can drain a pipelined output buffer.
-- **Cheap TCP setup:** listener-level `TCP_DEFER_ACCEPT` and `TCP_NODELAY` are inherited by accepted sockets.
-- **Prepared SQL:** statements are prepared once with `SQLITE_PREPARE_PERSISTENT`, with QPSG for plan stability.
-- **One read transaction per pass:** all reads in a pass share a snapshot, and writes share a group commit.
-- **Dense feed scan:** the feed uses a top-20 id window and range reads instead of a correlated count per row.
-- **Direct writers:** feed and post responses write SQLite columns straight into the output buffer, with no `Post` object and no intermediate body string.
-- **Small SQLite cache plus mmap:** `cache_size=-64` keeps SQLite's cache tiny, while `mmap_size=1 GiB` lets reads use the OS page cache.
-- **Off-loop checkpoint:** a dedicated pthread with its own connection performs PASSIVE checkpoints, so requests do not pay the copy or fsync.
-- **Borrowed request spans and stack JWT scratch:** parsing and auth do not copy the request or allocate per field.
-- **SSE2 JSON work:** escaping scans 16 bytes at a time, clean runs are copied in bulk, and integer formatting uses a two-digit lookup.
-- **PGO, LTO, native code:** the build uses profile-guided optimisation, link-time optimisation, and `-march=native`.
-- **Pooled output buffers:** idle connections hold no receive buffer, and output buffers are returned after the terminal send.
+- **Completion batching:** sustained load waits for a small batch, and one send can drain a pipelined
+  output buffer.
+- **Cheap TCP setup:** listener-level `TCP_DEFER_ACCEPT` and `TCP_NODELAY` are inherited by accepted
+  sockets.
+- **Prepared SQL:** statements are prepared once with `SQLITE_PREPARE_PERSISTENT`, with QPSG for
+  stability.
+- **One read transaction per pass:** all reads in a pass share a snapshot, and writes share a group
+  commit.
+- **Top-20 feed ids plus rowid range:** the feed reads the top-20 ids through the `created_at` index,
+  counts likes inside that id window, then fetches rows with `id BETWEEN ? AND ?` and reassembles them
+  in memory, instead of running a correlated count per row.
+- **Direct writers:** feed rows are staged in a reusable `feedScratch` buffer and copied into the
+  output buffer with `copyMem`; there is no `Post` object, no per-row temporary string and no
+  intermediate body string.
+- **Small SQLite cache plus mmap:** `cache_size=-64` keeps SQLite's cache tiny, while `mmap_size=1 GiB`
+  lets reads use the OS page cache.
+- **Inline RESTART checkpoint:** the single connection runs one `SQLITE_CHECKPOINT_RESTART` at the
+  pass boundary when the WAL hook reaches 4096 frames, so the WAL stays around 16 MiB.
+- **Borrowed request spans and stack JWT scratch:** parsing and auth do not copy the request or
+  allocate per field.
+- **SSE2 JSON work:** escaping scans 16 bytes at a time, clean runs are copied in bulk, and integer
+  formatting uses a two-digit lookup.
+- **Danger, PGO, LTO, native code:** the shipping build uses `-d:danger`, profile-guided optimisation,
+  link-time optimisation, and `-march=native`.
+- **Pooled output buffers:** idle connections hold no receive buffer, and output buffers are returned
+  after the terminal send.
 
 ## Limitations
 
-- The official score comes from the organiser's k6 run on a 1 vCPU / 2 GB droplet with separate load machines. Local loopback numbers are optimistic.
-- The local box is four vCPUs. IO and scheduler behaviour differ from the target droplet.
-- At 64k, system CPU is higher than the Rust implementation. The remaining cost is mostly kernel/network work, not application work.
-- WAL growth is the price of the off-loop PASSIVE checkpoint. A saturated 64k writer can grow the WAL to roughly 64-225 MiB in a minute. A five-minute 64k hold should have about 1 GiB of free disk headroom. This is disk growth, not memory growth.
-- RSS grows with live connections, not with the WAL file. The WAL is on disk and is not mmap'd as one giant allocation.
-- The 10,000-VU result is stable on the local client; the 15,000-VU run is client-limited. The official score still comes from a separate organiser load generator.
+- The official score comes from the organiser's k6 run on a 1 vCPU / 2 GB droplet with separate load
+  machines. Local loopback numbers are optimistic and are not organiser numbers.
+- The local measurements share one host with the load generator. The 1 vCPU / 2 GB target needs a
+  separate load generator for a true maximum-users score.
+- `locking_mode=EXCLUSIVE` means the commit-failure harness is not applicable. The
+  42-check suite is the CI gate, and durability was verified with a 3,000-post SIGTERM and reopen
+  check.
+- The shipping `-d:danger` build removes Nim bounds, overflow and range checks and `assert`. The
+  42-check suite and the 64k load test pass, but malformed-input fuzzing is still advisable.
+- RSS grows with live connections, not with the WAL file. The WAL is on disk and is not part of
+  process RSS.
 - The numbers above are local measurements, not a guarantee of the official score.

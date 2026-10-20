@@ -9,11 +9,11 @@
 ## The first read of a pass opens ONE `BEGIN DEFERRED` (prepared once, stepped
 ## like any other statement); every read statement of that pass runs inside it
 ## and the server COMMITs it at the pass boundary (`endRead`). Without this,
-## each statement ran in its own implicit transaction and `sqlite3_reset` ended
-## it: the old feed scan alone paid three transaction setups per request. The
-## explicit transaction is held only until the end of the pass -- never across
-## passes and never across the WAL checkpoint -- so the connection always sees writes that
-## committed during an earlier pass and PASSIVE checkpointing never has to skip
+## each statement would run in its own implicit transaction and `sqlite3_reset`
+## would end it; the feed scan alone would pay three transaction setups per
+## request. The explicit transaction is held only until the end of the pass -- never across
+## passes and never across a WAL checkpoint -- so the connection always sees writes that
+## committed during an earlier pass and the inline checkpoint never has to skip
 ## frames because of a stale reader snapshot.
 ##
 ## Invariants:
@@ -21,13 +21,17 @@
 ##       read transaction before `BEGIN IMMEDIATE`, so a read-then-write pass
 ##       never nests transactions and an autocommit write (group commit off)
 ##       never silently joins the read snapshot.
-##   (b) the read transaction is ended at the pass boundary (`endRead`), before
-##       the checkpointer can backfill the frames that transaction still pins.
-##       The checkpoint itself runs on its OWN connection/thread (see below), so
-##       no SQLite call for it ever runs between a request's reads/writes.
+##   (b) the read transaction is ended at the pass boundary (`endRead`) BEFORE
+##       `maybeCheckpoint` runs. The checkpoint is inline on this same
+##       connection, so a live snapshot would make RESTART return SQLITE_BUSY.
 ##   (c) every read statement is reset after use, so no statement is left
 ##       ACTIVE at the pass boundary; reset no longer ends the read transaction
 ##       (the explicit COMMIT does), it only makes the statement reusable.
+##   (d) there is exactly ONE SQLite connection, owned by the event-loop thread.
+##       The WAL hook only records a frame count; the RESTART checkpoint runs
+##       inline on that same connection at the pass boundary. The database is
+##       held `locking_mode=EXCLUSIVE`, so no other process/connection can pin
+##       a reader snapshot either.
 ##
 ## Write batching (group commit)
 ## -----------------------------
@@ -52,7 +56,6 @@
 import std/[os, strutils]
 
 import ./sqlite3
-import ./checkpoint
 import ./model
 import ./jsonbuf
 import ./http
@@ -65,7 +68,12 @@ type
     bsOpen    ## BEGIN IMMEDIATE issued, not yet committed
     bsFailed  ## the batch hit an unexpected error; COMMIT must report failure
 
-  CheckpointStats* = CkStats
+  CheckpointDiag* = object
+    ## Observable inline-checkpoint state, for tests and diagnostics.
+    walFrames*: int32       ## WAL frames counted by the WAL hook since last reset
+    count*: int             ## successful RESTART checkpoints (WAL frame reset)
+    busy*: int              ## SQLITE_BUSY checkpoints; counter kept for retry
+    errors*: int            ## other checkpoint failures
 
   Db* = ref object
     handle: ptr Sqlite3
@@ -87,14 +95,20 @@ type
     groupCommit: bool
     batchState: BatchState
     readOpen: bool       ## the pass's deferred read transaction is open
-    path: string         ## the database path (used once to start the worker)
-    ckCtx: pointer       ## opaque CkCtx* owned by the checkpoint thread
-    ckStats: CheckpointStats  ## final stats cached at stop (ckCtx is freed)
+    walFrames: int32     ## WAL frame count recorded by the hook, reset by a RESTART checkpoint
+    checkpointCount: int
+    checkpointBusy: int
+    checkpointErrors: int
+    feedScratch: string  ## reusable feed row staging buffer (reset per feed)
 
   LikeOutcome* = enum
     loLiked, loAlready, loNoPost
 
 const
+  WalCheckpointFrames* = 4096
+    ## Run an inline RESTART checkpoint once the WAL hook has counted this many
+    ## frames since the last successful reset.
+
   SqlSelectPost = """
 SELECT p.id, p.body, p.created_at, u.username,
        (SELECT count(*) FROM likes l WHERE l.post_id = p.id)
@@ -127,23 +141,15 @@ LIMIT 20"""
 SELECT post_id FROM likes
 WHERE post_id BETWEEN ? AND ?"""
 
-  # 3. Row data for the window, in feed order. Same SELECT/JOIN shape as
+  # 3. Row data for the window in plain rowid order. Same SELECT/JOIN shape as
   #    SqlSelectFeed, minus the like_count subquery (likes come from
-  #    SqlFeedLikes), keeping its ORDER BY and LIMIT. INDEXED BY pins the scan
-  #    to the (created_at DESC, id DESC) index, whose order is already the feed
-  #    order, so no temp B-tree sort is needed. The id-range predicate matches
-  #    the bounded feed_rows statement: it excludes posts outside the
-  #    top-20 id window before the users join, which measured cheaper at 64k
-  #    than relying on LIMIT alone. A missing join row shifts the rows relative
-  #    to the ids, which the sequential-id guard detects and declines to the
-  #    ordered query.
+  #    SqlFeedLikes) and without ORDER BY or INDEXED BY: the caller places each
+  #    row into its feed slot and emits the slots in feed order, so this is a
+  #    cheap rowid range scan instead of an ordered index scan. A missing or
+  #    duplicate top-id row makes the found count disagree with the id count,
+  #    which declines to the ordered query.
   SqlFeedRows = """
-SELECT p.id, p.body, p.created_at, u.username
-FROM posts p INDEXED BY posts_created_at_id_idx
-JOIN users u ON u.id = p.user_id
-WHERE p.id BETWEEN ? AND ?
-ORDER BY p.created_at DESC, p.id DESC
-LIMIT 20"""
+SELECT p.id, p.body, p.created_at, u.username FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id BETWEEN ? AND ?"""
 
   SqlInsertPost = "INSERT INTO posts(user_id, body) VALUES(?, ?)"
 
@@ -181,21 +187,24 @@ proc fail(db: Db, what: string) {.noreturn.} =
     what & " failed (rc=" & $sqlite3_errcode(db.handle) & "): " & db.errMsg())
 
 proc execPragma(db: Db, pragma: string, tolerate: bool) =
-  ## Run a single PRAGMA. When `tolerate`, a failure (e.g. journal_mode already
-  ## WAL under a second connection) is ignored instead of aborting open.
+  ## Run a single PRAGMA. When `tolerate`, a failure is ignored instead of
+  ## aborting open. No pragma on the server path is tolerated today; the
+  ## parameter is kept because the tests still exercise the helper.
   let rc = sqlite3_exec(db.handle, ("PRAGMA " & pragma).cstring, nil, nil, nil)
   if rc != SQLITE_OK and not tolerate:
     db.fail("PRAGMA " & pragma)
 
 proc applyPragmas(db: Db) =
-  ## Applied in this order. WAL must succeed: the off-loop checkpoint design
-  ## assumes a WAL database, and journal_mode=WAL is idempotent on an existing
-  ## WAL database.
+  ## Applied in this order. The database is held `locking_mode=EXCLUSIVE`:
+  ## with exactly one connection in the process there is no other reader to
+  ## coordinate with, EXCLUSIVE skips the per-statement shared-lock traffic, and
+  ## it makes WAL reset deterministic (no connection can pin a snapshot). The
+  ## side effect is deliberate and load-bearing: no other process/connection can
+  ## open the database while the server runs.
   ##
-  ## `locking_mode=NORMAL` (not EXCLUSIVE): EXCLUSIVE is a little cheaper per
-  ## statement, but it makes the file unopenable by the checkpointer's second
-  ## connection. The checkpoint connection must exist from the first WAL
-  ## access, so NORMAL is the mode from the start (never a mid-run switch).
+  ## journal_mode=WAL must succeed (journal_mode=WAL is idempotent on an existing
+  ## WAL database), because the inline checkpoint design assumes a WAL database.
+  db.execPragma("locking_mode=EXCLUSIVE", tolerate = false)
   db.execPragma("journal_mode=WAL", tolerate = false)
   db.execPragma("synchronous=NORMAL", tolerate = false)
   db.execPragma("busy_timeout=5000", tolerate = false)
@@ -209,20 +218,16 @@ proc applyPragmas(db: Db) =
   except ValueError:
     mmapBytes = 1073741824
   db.execPragma("mmap_size=" & $mmapBytes, tolerate = false)
-  # WAL autocheckpoint is DISABLED (0): the WAL is checkpointed explicitly by
-  # the dedicated checkpoint connection/thread (SQLITE_CHECKPOINT_PASSIVE,
-  # coalesced to ~1/s). That keeps the checkpoint copy + fsync off the request
-  # thread. journal_size_limit is still set, but note a PASSIVE checkpoint can
-  # trail the write head while the writer is continuously active, so the WAL
-  # file may grow until a natural quiet point lets SQLite reset it (measured:
-  # bounded at 64 MiB at 32k paced, growing during a saturated 64k run).
-  # Disk headroom: under a 5-minute 64k hold the WAL reached ~143-225 MiB in
-  # 60 s (~3.7 MB/s) and needs roughly 1 GiB of free disk; 32k paced settles at
-  # the 64 MiB journal_size_limit. RESTART/FULL are never used under load
-  # because they wait for readers and block the writer.
+  # WAL autocheckpoint is DISABLED (0): the one request connection runs an
+  # explicit RESTART checkpoint INLINE at a pass boundary when the WAL hook has
+  # counted >= WalCheckpointFrames frames. RESTART rewinds the WAL once every
+  # reader is done (there is at most our own pass boundary, and EXCLUSIVE
+  # locking keeps any other process out), so the file is reused instead of
+  # growing without bound. journal_size_limit caps the file after a checkpoint.
+  # Disk headroom: the WAL can still reach WalCheckpointFrames * page_size
+  # between two checkpoints (~16 MiB at 4 KiB pages) plus one pass of writes.
   db.execPragma("wal_autocheckpoint=0", tolerate = false)
   db.execPragma("journal_size_limit=67108864", tolerate = false)
-  db.execPragma("locking_mode=NORMAL", tolerate = false)
 
 proc prepare(db: Db, sql: string): ptr Sqlite3Stmt =
   var stmt: ptr Sqlite3Stmt
@@ -276,7 +281,7 @@ proc addJColText(buf: var string, stmt: ptr Sqlite3Stmt, i: cint) =
   ## pointer is escaped in place immediately, before any further sqlite3 call,
   ## and its length comes from sqlite3_column_bytes (column text is not
   ## NUL-terminated). A NULL/empty column still emits `""`, exactly like the
-  ## old colText -> Post -> object serializer path.
+  ## canonical Post JSON serializer.
   buf.add '"'
   let p = sqlite3_column_text(stmt, i)
   if p != nil:
@@ -330,8 +335,8 @@ proc endRead*(db: Db): bool =
 
 proc setGroupCommit*(db: Db, on: bool) =
   ## Enable/disable write batching. Called once at startup from the GROUP_COMMIT
-  ## environment flag (default ON in the server). Disabling it restores the old
-  ## autocommit behavior byte-for-byte.
+  ## environment flag (default ON in the server). Disabling it uses autocommit,
+  ## so each write is durable before the proc returns.
   db.groupCommit = on
 
 proc batchOpen*(db: Db): bool =
@@ -387,67 +392,66 @@ proc commitBatch*(db: Db): bool =
       result = false
 
 # ---------------------------------------------------------------------------
-# off-loop WAL checkpoint
+# inline WAL checkpoint on the one request connection
 #
-# The request connection never runs a checkpoint. A second connection, owned by
-# a dedicated pthread (src/checkpoint.nim), runs PASSIVE checkpoints. The
-# only coupling between the threads is SQLite's own database/WAL state plus:
-#   * an atomic `checkpointWanted` flag raised by the WAL hook, and
-#   * an eventfd written when the flag transitions 0 -> 1 to wake the worker.
-# The hook runs on the request thread after a commit releases the write lock.
-# It calls NO SQLite API: doing a checkpoint there would put the copy/fsync back
-# on the request thread, which is exactly what this design removes.
+# The WAL hook runs on the committing thread after a transaction appends frames
+# to the WAL. It must stay trivial: no SQLite call, no allocation, no wakeup.
+# It records the WAL's new total frame count in `walFrames`.
 #
-# The second connection is READWRITE because a checkpoint must write database
-# pages back into the DB file, but it never executes a data-modifying statement.
-# It runs exactly one PASSIVE checkpoint per interval (coalesced); RESTART and
-# FULL are deliberately never used while the writer is active because both wait
-# for readers and block new writers.
+# `maybeCheckpoint` is called by the event loop at the process-wide pass
+# boundary, AFTER the pass COMMIT and AFTER `endRead` has closed the read
+# snapshot (and with every statement reset). At that point this connection is
+# the only reader/writer -- EXCLUSIVE locking keeps other processes out -- so
+# SQLITE_CHECKPOINT_RESTART can copy every frame back into the database and
+# rewind the WAL to frame 0 in one call. The counter is reset only on success:
+# on SQLITE_BUSY it is left in place so the next pass retries, and a failure
+# never spins inside one pass. FULL and TRUNCATE are never used.
 
-proc startCheckpointer*(db: Db) =
-  ## Create the checkpoint connection and its worker thread, and install the
-  ## WAL hook on the request connection. Called once at startup (and by the DB
-  ## unit test). Raises if the worker cannot start: shipping a server whose WAL
-  ## is never checkpointed would grow it without bound.
-  if db.ckCtx != nil:
+proc walHook(pArg: pointer; db: ptr Sqlite3; zDb: cstring;
+             nFrame: cint): cint {.cdecl, raises: [].} =
+  ## `nFrame` is the WAL's total frame count after this commit, so the counter
+  ## is SET, not accumulated. `pArg` points at Db.walFrames, which outlives the
+  ## connection (openDb installs it; the connection is never re-hooked and lives
+  ## until process exit). No SQLite, allocator or lock is touched here.
+  if pArg != nil and nFrame >= 0:
+    cast[ptr int32](pArg)[] = int32(nFrame)
+  0
+
+proc maybeCheckpoint*(db: Db) =
+  ## Pass-boundary checkpoint. Safe only after the pass COMMIT and `endRead`,
+  ## with no statement ACTIVE and no transaction open; the server calls it there.
+  ## The transaction guard makes a failed pass-boundary COMMIT defer the
+  ## checkpoint to the next pass instead of checkpointing past a live snapshot.
+  ## One attempt per call: SQLITE_BUSY leaves the frame counter untouched for a
+  ## later pass instead of retrying in a loop.
+  if db.readOpen or db.batchState != bsNone:
     return
-  db.ckCtx = ckStart(db.path.cstring, 1000)
-  if db.ckCtx == nil:
-    raise newException(DbError, "checkpoint thread failed to start")
-  # The hook belongs to the request connection only. The checkpoint connection
-  # has no hook and takes no part in signalling.
-  ckInstallHook(cast[pointer](db.handle), db.ckCtx)
-
-proc requestCheckpoint*(db: Db) =
-  ## Raise the same flag the WAL hook raises. Not needed on the production path
-  ## (every commit triggers the hook); exposed for tests and shutdown.
-  if db.ckCtx != nil:
-    discard ckSignal(db.ckCtx)
-
-proc checkpointStats*(db: Db): CheckpointStats =
-  ## Live counters while the worker runs, or the final counters cached at
-  ## `stopCheckpointer`. Never reads a freed CkCtx.
-  if db.ckCtx != nil:
-    ckStats(db.ckCtx, addr result)
+  if db.walFrames < WalCheckpointFrames:
+    return
+  # Bound how long RESTART may wait for a reader. The request thread itself is
+  # the only reader in the process and the pass boundary has already committed
+  # its read transaction; this guards the pathological case (a leftover reader)
+  # without letting a checkpoint stall the request thread for seconds.
+  discard sqlite3_busy_timeout(db.handle, 0)
+  let rc = sqlite3_wal_checkpoint_v2(db.handle, nil,
+                                     SQLITE_CHECKPOINT_RESTART, nil, nil)
+  discard sqlite3_busy_timeout(db.handle, 5000)
+  if rc == SQLITE_OK:
+    # The WAL was reset to frame 0; start counting the next WAL generation.
+    inc db.checkpointCount
+    db.walFrames = 0
+    db.checkpointBusy = 0
+  elif rc == SQLITE_BUSY:
+    inc db.checkpointBusy
   else:
-    result = db.ckStats
+    inc db.checkpointErrors
 
-proc stopCheckpointer*(db: Db) =
-  ## Stop and join the worker; any checkpoint still wanted runs before the
-  ## thread exits, and its final counters are cached on `db`.
-  ##
-  ## The WAL hook is uninstalled BEFORE the context is freed: otherwise the
-  ## request connection's pWalArg would still point at it and a later COMMIT
-  ## would call ckSignal() on freed memory. Clearing `ckCtx` first makes a
-  ## second call a no-op (single owner, idempotent).
-  if db.ckCtx == nil:
-    return
-  let ctx = db.ckCtx
-  db.ckCtx = nil
-  ckUninstallHook(cast[pointer](db.handle))
-  var st: CheckpointStats
-  ckStop(ctx, addr st)
-  db.ckStats = st
+proc checkpointDiag*(db: Db): CheckpointDiag =
+  ## Snapshot of the inline checkpoint counters (no SQLite call).
+  result.walFrames = db.walFrames
+  result.count = db.checkpointCount
+  result.busy = db.checkpointBusy
+  result.errors = db.checkpointErrors
 
 # ---------------------------------------------------------------------------
 # public API
@@ -462,27 +466,27 @@ proc stopCheckpointer*(db: Db) =
 # DEFERRED` transaction owns that snapshot until `endRead` COMMITs it.
 
 proc openDb*(path: string): Db =
-  ## Open the request-loop connection with `locking_mode=NORMAL` and
+  ## Open the ONE request-loop connection with `locking_mode=EXCLUSIVE` and
   ## `SQLITE_OPEN_NOMUTEX` (this connection is only ever used by the thread
-  ## that opened it). The checkpoint connection is created later by
-  ## `startCheckpointer`.
+  ## that opened it). There is no checkpoint connection and no checkpoint
+  ## thread: the WAL hook below and `maybeCheckpoint` both belong to this
+  ## connection.
   ##
   ## The bundled SQLite is compiled with SQLITE_OMIT_AUTOINIT (see sqlite3.nim),
   ## so the library is initialized exactly once, here, before the first call into
   ## it. sqlite3_initialize() is idempotent and is the ONLY SQLite entry point
-  ## that may run before this call returns. Threading mode is verified after
-  ## initialization: a second connection on another thread is only legal when
-  ## the amalgamation was compiled SQLITE_THREADSAFE=2.
+  ## that may run before this call returns. The database is single-threaded and
+  ## single-connection, so THREADSAFE=0 is required and verified.
   let irc = sqlite3_initialize()
   if irc != SQLITE_OK:
     raise newException(DbError, "sqlite3_initialize failed (rc=" & $irc & ")")
-  if sqlite3_threadsafe() != 2:
+  if sqlite3_threadsafe() != 0:
     raise newException(DbError,
-      "SQLite is not compiled SQLITE_THREADSAFE=2 (sqlite3_threadsafe()=" &
-      $(sqlite3_threadsafe()) & "); the checkpoint connection is unsafe")
+      "SQLite is not compiled SQLITE_THREADSAFE=0 (sqlite3_threadsafe()=" &
+      $(sqlite3_threadsafe()) & ")")
 
   new(result)
-  result.path = path
+  result.feedScratch = newStringOfCap(16384)
   let rc = sqlite3_open_v2(path.cstring, addr result.handle,
                            SQLITE_OPEN_READWRITE or SQLITE_OPEN_NOMUTEX, nil)
   if rc != SQLITE_OK:
@@ -508,6 +512,55 @@ proc openDb*(path: string): Db =
   result.stmtBeginBatch = result.prepare(SqlBeginBatch)
   result.stmtCommitBatch = result.prepare(SqlCommitBatch)
   result.stmtRollbackBatch = result.prepare(SqlRollbackBatch)
+
+  # The hook belongs to this connection and points at this Db's counter, which
+  # is stable for the lifetime of the ref object. It cannot fire before this
+  # point because nothing has committed yet. There is deliberately no uninstall:
+  # the connection and the Db both live until process exit.
+  discard sqlite3_wal_hook(result.handle, walHook, addr result.walFrames)
+
+proc closeDb*(db: Db) =
+  ## Close the one connection. The WAL hook is uninstalled first so no later
+  ## COMMIT can reach a freed/reused Db, then every prepared statement is
+  ## finalized and the connection is closed. Idempotent. The server never calls
+  ## this (the connection lives until process exit); the DB unit test does, to
+  ## prove close/reopen works on the single-connection design.
+  if db == nil or db.handle == nil:
+    return
+  discard sqlite3_wal_hook(db.handle, nil, nil)
+  if db.stmtGetPost != nil: discard sqlite3_finalize(db.stmtGetPost)
+  if db.stmtFeed != nil: discard sqlite3_finalize(db.stmtFeed)
+  if db.stmtFeedIds != nil: discard sqlite3_finalize(db.stmtFeedIds)
+  if db.stmtFeedLikes != nil: discard sqlite3_finalize(db.stmtFeedLikes)
+  if db.stmtFeedRows != nil: discard sqlite3_finalize(db.stmtFeedRows)
+  if db.stmtInsertPost != nil: discard sqlite3_finalize(db.stmtInsertPost)
+  if db.stmtCreatedAt != nil: discard sqlite3_finalize(db.stmtCreatedAt)
+  if db.stmtInsertLike != nil: discard sqlite3_finalize(db.stmtInsertLike)
+  if db.stmtExistsPost != nil: discard sqlite3_finalize(db.stmtExistsPost)
+  if db.stmtHealth != nil: discard sqlite3_finalize(db.stmtHealth)
+  if db.stmtBeginRead != nil: discard sqlite3_finalize(db.stmtBeginRead)
+  if db.stmtCommitRead != nil: discard sqlite3_finalize(db.stmtCommitRead)
+  if db.stmtBeginBatch != nil: discard sqlite3_finalize(db.stmtBeginBatch)
+  if db.stmtCommitBatch != nil: discard sqlite3_finalize(db.stmtCommitBatch)
+  if db.stmtRollbackBatch != nil: discard sqlite3_finalize(db.stmtRollbackBatch)
+  db.stmtGetPost = nil
+  db.stmtFeed = nil
+  db.stmtFeedIds = nil
+  db.stmtFeedLikes = nil
+  db.stmtFeedRows = nil
+  db.stmtInsertPost = nil
+  db.stmtCreatedAt = nil
+  db.stmtInsertLike = nil
+  db.stmtExistsPost = nil
+  db.stmtHealth = nil
+  db.stmtBeginRead = nil
+  db.stmtCommitRead = nil
+  db.stmtBeginBatch = nil
+  db.stmtCommitBatch = nil
+  db.stmtRollbackBatch = nil
+  let handle = db.handle
+  db.handle = nil
+  discard sqlite3_close_v2(handle)
 
 proc health*(db: Db): bool =
   ## The health probe needs no snapshot: `SELECT 1` reads no table, so it does
@@ -599,20 +652,19 @@ proc writeFeedFallbackJson*(db: Db, buf: var string) =
 proc writeFeedJson*(db: Db, buf: var string) =
   ## Serialize the feed (created_at DESC, id DESC, up to 20 posts) into `buf`
   ## straight from SQLite's columns. No Post object, per-column string or
-  ## intermediate body string is built; the bytes match the previous
-  ## Post-object serialization.
+  ## intermediate body string is built; the bytes match the canonical Post JSON
+  ## serialization.
   ##
   ## Dense-range scan: the top-20 ids usually fit in a
   ## small window, so three cheap range statements (ids, likes, rows) replace
   ## the ordered query with its 20 correlated like_count subqueries. The row
-  ## scan is bounded by `WHERE p.id BETWEEN ? AND ?` over that same id window.
-  ## Rows are ordered exactly like the ids, so each row is written as it is
-  ## stepped; the slot map only attributes the like counts gathered from the id
-  ## window.
+  ## scan is bounded by `WHERE p.id BETWEEN ? AND ?` over that same id window
+  ## and returns rows in rowid order, so each row is written into a scratch
+  ## buffer at its feed slot and the slots are emitted in feed order.
   ##
   ## Declines to the original ordered query when:
   ##   * (maxId - minId) >= 256 : the window would scan too many unrelated rows.
-  ##   * a row is missing or out of order : the scan is not a faithful
+  ##   * a top-id row is missing or duplicated : the row set is not a faithful
   ##     replacement (e.g. a top id whose join row is absent).
   const MaxSpan = 256
   let mark = buf.len            # body boundary; restored on decline
@@ -673,36 +725,46 @@ proc writeFeedJson*(db: Db, buf: var string) =
     else:
       db.fail("feed likes step")
 
-  # 5. rows in the window, already in feed order; write each one immediately.
-  #    minId/maxId bound the scan to the same top-20 id window (`WHERE p.id
-  #    BETWEEN ? AND ?`); the index order is the feed order, and the guard below
-  #    declines whenever the joined rows do not match the top-20 ids.
+  # 5. rows in the window, in rowid order. Each row is serialized into a
+  #    scratch buffer at its feed slot; nothing is written to `buf` until the
+  #    whole row set has been validated, so a decline cannot leak partial
+  #    bytes. minId/maxId bound the scan to the same top-20 id window
+  #    (`WHERE p.id BETWEEN ? AND ?`); the found count must match the id count.
   let rwStmt = db.stmtFeedRows
   defer: resetStmt(rwStmt)    # also on db.fail: never leave it ACTIVE
   bindInt(rwStmt, 1, minId)
   bindInt(rwStmt, 2, maxId)
-  buf.add "{\"posts\":["
-  var idx = 0
-  var ok = true
+  db.feedScratch.setLen(0)
+  var segments: array[20, tuple[start, stop: int]]
+  var found = 0
   while true:
     let rc = sqlite3_step(rwStmt)
     if rc == SQLITE_ROW:
       let pid = sqlite3_column_int64(rwStmt, 0)
-      if idx >= n or pid != topIds[idx]:
-        ok = false                  # missing/out-of-order row: use the fallback
-        break
-      if idx > 0: buf.add ','
-      writePostRow(buf, rwStmt, likeFor[idx])
-      inc idx
+      let slot = slotOf[int(pid - minId)]
+      if slot >= 0:
+        let start = db.feedScratch.len
+        writePostRow(db.feedScratch, rwStmt, likeFor[slot])
+        segments[slot] = (start, db.feedScratch.len)
+        inc found
     elif rc == SQLITE_DONE:
       break
     else:
       db.fail("feed rows step")
 
-  if not ok or idx != n:
-    buf.setLen(mark)
+  if found != n:
+    buf.setLen(mark)              # defensive: no partial bytes may leak
     db.writeFeedFallbackJson(buf)
     return
+  buf.add "{\"posts\":["
+  for i in 0 ..< n:
+    if i > 0: buf.add ','
+    let start = segments[i].start
+    let stop = segments[i].stop
+    let oldLen = buf.len
+    buf.setLen(oldLen + (stop - start))
+    if stop > start:
+      copyMem(addr buf[oldLen], unsafeAddr db.feedScratch[start], stop - start)
   buf.add "]}"
 
 # ---------------------------------------------------------------------------

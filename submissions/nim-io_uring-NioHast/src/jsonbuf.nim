@@ -81,8 +81,8 @@ proc addEscapedRaw*(buf: var string, p: ptr UncheckedArray[char], n: int) =
   ##
   ## Clean runs are found 16 bytes at a time with SSE2, then copied in one bulk
   ## append; only the final < 16 bytes and the bytes following each trigger are
-  ## scanned scalar. The escape sequences are byte-for-byte the ones the
-  ## previous per-character writer produced.
+  ## scanned scalar. The escape sequences are byte-for-byte the canonical JSON
+  ## escapes.
   var runStart = 0
   var i = 0
   if n >= 16:
@@ -121,8 +121,8 @@ proc addJStr*(buf: var string, s: string) =
   buf.add '"'
 
 ## Two decimal digits per byte pair, indexed by `value * 2`. Converting a
-## magnitude in 2-digit chunks halves the division count of the old per-digit
-## loop while writing straight into the destination buffer.
+## magnitude in 2-digit chunks halves the division count of a per-digit loop
+## while writing straight into the destination buffer.
 const DigitPairs = block:
   var s: array[200, char]
   for i in 0 ..< 100:
