@@ -40,16 +40,16 @@ This document describes the performance design of the server, including build-ti
 |---|---|---|
 | WAL mode | Readers use a snapshot while one writer appends to the WAL, so reads and writes do not block each other. | `src/db.nim` |
 | `synchronous=NORMAL` | Avoids a full fsync on every commit while keeping the database consistent. | `src/db.nim` |
-| `locking_mode=EXCLUSIVE` | With one connection in the process, skips shared-lock traffic and makes WAL reset deterministic; no other process or connection can open the database while the server runs. | `src/db.nim` |
+| `locking_mode=NORMAL` | Lets the dedicated checkpoint connection open the same database while the request connection runs. | `src/db.nim` |
 | `busy_timeout=5000` | Bounds how long a statement waits for a lock instead of failing immediately. | `src/db.nim` |
 | `foreign_keys=ON` | Enforces the schema's referential integrity. | `src/db.nim` |
 | `temp_store=MEMORY` | Keeps temporary B-trees in memory instead of writing them to disk. | `src/db.nim` |
 | `cache_size=-64` | Keeps SQLite's own page cache small and relies on the OS page cache for database pages. | `src/db.nim` |
 | `mmap_size=1 GiB` | Maps the main database file so reads can come from the OS page cache without a copy. | `src/db.nim` |
 | `journal_size_limit=64 MiB` | Caps how much WAL space is retained after a checkpoint. | `src/db.nim` |
-| `wal_autocheckpoint=0` | SQLite does not checkpoint automatically; the request loop decides when to run the inline RESTART checkpoint. | `src/db.nim` |
-| Inline RESTART checkpoint | The WAL hook records the frame count. At the process-wide pass boundary, after the pass COMMIT and `endRead`, the single connection runs one `SQLITE_CHECKPOINT_RESTART` when the count is at least 4096 frames, rewinding the WAL so it stays around 16 MiB. | `src/db.nim`, `src/server.nim` |
-| Busy-safe checkpoint retry | On `SQLITE_BUSY` the frame count is left in place and the next pass retries once; the checkpoint never spins inside a pass. | `src/db.nim` |
+| `wal_autocheckpoint=0` | SQLite does not checkpoint automatically; the dedicated worker decides when to run PASSIVE. | `src/db.nim` |
+| Off-loop PASSIVE checkpoint | The WAL hook raises an atomic flag and writes an eventfd. A second connection on its own pthread runs `SQLITE_CHECKPOINT_PASSIVE` about once per second. PASSIVE never waits for readers, so the request thread performs no checkpoint I/O. | `src/checkpoint.nim`, `src/db.nim`, `src/server.nim` |
+| WAL disk/latency trade | The WAL grows while the writer is continuously active (measured 92-104 MiB at 64k); `journal_size_limit=64 MiB` bounds it at a quiet point. Larger WAL is preferred over a multi-second request stall. | `src/db.nim`, `src/checkpoint.nim` |
 | Persistent prepared statements | SQL is parsed once with `SQLITE_PREPARE_PERSISTENT`, so the hot path reuses prepared statements. | `src/db.nim` |
 | QPSG | QPSG keeps a re-prepared statement stable. | `src/db.nim`, `src/sqlite3.nim` |
 | One read transaction per pass | All reads in an event-loop pass share one snapshot, reducing transaction and lock churn. | `src/db.nim`, `src/server.nim` |
@@ -65,7 +65,7 @@ This document describes the performance design of the server, including build-ti
 | Minimal statement resets | Statements are reset only where required; redundant binding clears were removed. | `src/db.nim` |
 | Prepared transaction control | BEGIN, COMMIT, and ROLLBACK are prepared once and reused. | `src/db.nim` |
 | SQLite-only data path | Every request reads SQLite; there is no in-process response cache, query cache, or table copy to invalidate. | `src/db.nim` |
-| SQLite compile trims | Unused SQLite features are omitted, QPSG is enabled, and the library is compiled `SQLITE_THREADSAFE=0` with `HAVE_FDATASYNC=1` for the one-connection design. | `src/sqlite3.nim`, `build.sh` |
+| SQLite compile trims | Unused SQLite features are omitted, QPSG is enabled, and the library is compiled `SQLITE_THREADSAFE=2` with `HAVE_FDATASYNC=1` for the request + checkpoint connections. | `src/sqlite3.nim`, `build.sh` |
 
 ## HTTP, JSON, and JWT
 
@@ -108,4 +108,4 @@ This document describes the performance design of the server, including build-ti
 | ENOBUFS and partial-send recovery | The loop re-arms or retries instead of dropping the connection when buffers or send space run out. | `src/server.nim` |
 | Deferred close handling | Buffered output is drained before a connection is closed. | `src/server.nim` |
 | Deferred batch rollback | Withheld responses become 500 responses if the transaction fails to commit. | `src/server.nim`, `src/db.nim` |
-| WAL startup check | Startup fails if SQLite cannot enable WAL, because the inline checkpoint design assumes a WAL database. | `src/db.nim` |
+| WAL startup check | Startup fails if SQLite cannot enable WAL, because the off-loop checkpoint design assumes a WAL database. | `src/db.nim` |

@@ -17,11 +17,16 @@
 ## The single C translation unit is compiled straight into the binary via
 ## `{.compile.}` with size/speed trims below.
 ##
-## THREADSAFE=0 (single-thread mode):
-##   The server owns ONE SQLite connection on ONE request thread and performs
-##   the WAL checkpoint inline on that connection at the pass boundary.
-##   `sqlite3_threadsafe()` therefore returns 0 and openDb() asserts it. The
-##   process opens exactly one connection while the server runs.
+## THREADSAFE=2 (multi-thread mode), not 0:
+##   The request loop and the WAL checkpointer each own ONE connection, used
+##   only by their own OS thread. With THREADSAFE=0 SQLite omits the
+##   global/connection serialisation that makes two connections on two threads
+##   legal (and `sqlite3_threadsafe()` reports 0). Mode 2 keeps the
+##   per-connection mutexes OUT of the hot path because both connections are
+##   opened SQLITE_OPEN_NOMUTEX, while SQLite's internal WAL/index coordination
+##   between connections is still compiled in. Each connection is still used by
+##   exactly one thread at a time. openDb() verifies
+##   `sqlite3_threadsafe() == 2` and refuses to start otherwise.
 
 ## Syntax note: Nim 2.2.12 accepts the `compile` pragma as `{.compile(file,
 ## options).}` where `options` is ONE space-separated string forwarded verbatim
@@ -48,7 +53,7 @@
 ##                                  never re-plans. (added)
 ## The original flags are all preserved verbatim.
 {.compile("../vendor/sqlite3.c",
-  "-O3 -DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DQS=0 -DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_QPSG -DSQLITE_USE_ALLOCA=1 -DSQLITE_OMIT_DECLTYPE -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_AUTOINIT -DHAVE_FDATASYNC=1").}
+  "-O3 -DSQLITE_THREADSAFE=2 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_DQS=0 -DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_QPSG -DSQLITE_USE_ALLOCA=1 -DSQLITE_OMIT_DECLTYPE -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -DSQLITE_OMIT_AUTOINIT -DHAVE_FDATASYNC=1").}
 
 type
   Sqlite3* {.incompleteStruct.} = object
@@ -73,9 +78,9 @@ const
   SQLITE_BUSY* = 5
   SQLITE_ROW* = 100
   SQLITE_DONE* = 101
-  ## `sqlite3_wal_checkpoint_v2` modes. The server uses only RESTART: it copies
-  ## every WAL frame back into the database and rewinds the WAL to frame 0, so
-  ## the file is reused instead of growing without bound.
+  ## `sqlite3_wal_checkpoint_v2` modes. The checkpointer uses only PASSIVE:
+  ## it copies as many frames as it can without waiting for readers, so it can
+  ## never stall the request thread. FULL/RESTART wait for readers.
   SQLITE_CHECKPOINT_PASSIVE* = 0
   SQLITE_CHECKPOINT_FULL* = 1
   SQLITE_CHECKPOINT_RESTART* = 2
@@ -95,9 +100,8 @@ proc sqlite3_initialize*(): cint
   {.importc, header: "vendor/sqlite3.h".}
 
 ## Compile-time threading mode: 0=single-thread, 2=multi-thread. openDb()
-## requires 0: the whole process owns exactly ONE connection on the request
-## thread, so SQLite must not compile in any thread serialisation (see the
-## THREADSAFE note at the top of this module).
+## requires 2 because the checkpointer owns a second connection on its own
+## thread (see the THREADSAFE note at the top of this module).
 proc sqlite3_threadsafe*(): cint
   {.importc, header: "vendor/sqlite3.h".}
 
@@ -132,9 +136,9 @@ proc sqlite3_column_int64*(stmt: ptr Sqlite3Stmt, iCol: cint): int64
 proc sqlite3_reset*(stmt: ptr Sqlite3Stmt): cint
   {.importc, header: "vendor/sqlite3.h".}
 
-## Change the connection's busy timeout. `maybeCheckpoint` lowers it to 0 for
-## the one RESTART attempt so a pathological reader cannot stall the request
-## thread, then restores the 5000 ms configured by the pragmas.
+## Change the checkpoint connection's busy timeout. The worker uses this to
+## bound how long a PASSIVE attempt waits on a lock; the request connection's
+## timeout is configured by its PRAGMAs.
 proc sqlite3_busy_timeout*(db: ptr Sqlite3, ms: cint): cint
   {.importc, header: "vendor/sqlite3.h".}
 
@@ -167,8 +171,8 @@ proc sqlite3_wal_hook*(db: ptr Sqlite3, cb: Sqlite3WalHook, data: pointer): poin
   {.importc, header: "vendor/sqlite3.h".}
 
 ## Run a checkpoint on the connection's own database. `zDb == nil` selects the
-## main database. `RESTART` returns SQLITE_BUSY when another connection pins
-## the WAL; with one connection the pass boundary has no other reader.
+## main database. PASSIVE never waits for readers or blocks the writer; it is
+## run only by the dedicated checkpoint thread.
 proc sqlite3_wal_checkpoint_v2*(db: ptr Sqlite3, zDb: cstring, eMode: cint,
                                 pnLog: ptr cint, pnCkpt: ptr cint): cint
   {.importc, header: "vendor/sqlite3.h".}

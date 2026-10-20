@@ -104,18 +104,19 @@ Run time (environment for `start.sh`):
 fixed-file table; the auto-sizer picks the ring count from `RLIMIT_NOFILE` and the machine's
 conntrack limit.
 
-Everything else is deliberately fixed in code and not tunable at run time: one request thread and one
-SQLite connection per process, persistent prepared statements, WAL + `synchronous=NORMAL`, an inline
-`SQLITE_CHECKPOINT_RESTART` at the process-wide pass boundary, the 4096 listen backlog, EMFILE
-backoff, the 1 s idle/stall sweep (75 s idle / 30 s stalled), the 1 s `TCP_DEFER_ACCEPT` wait (always
-one second), and the O(n) parser.
+Everything else is deliberately fixed in code and not tunable at run time: one request thread, one
+request SQLite connection plus one checkpoint connection on a dedicated pthread, persistent prepared
+statements, WAL + `synchronous=NORMAL`, an off-loop `SQLITE_CHECKPOINT_PASSIVE` driven by the WAL hook,
+the 4096 listen backlog, EMFILE backoff, the 1 s idle/stall sweep (75 s idle / 30 s stalled), the 1 s
+`TCP_DEFER_ACCEPT` wait (always one second), and the O(n) parser.
 
 ## Architecture
 
-One process, **one request thread**, one io_uring event loop, and **one SQLite connection**. On a
-1 vCPU box more request threads only add context switches; one loop keeps latency predictable and
-memory per connection tiny. The single connection runs all SQL and the inline RESTART checkpoint at
-the pass boundary. `locking_mode=EXCLUSIVE` keeps any other process or connection out.
+One process, **one request thread**, one io_uring event loop, one request SQLite connection, and one
+checkpoint connection owned by a dedicated pthread. On a 1 vCPU box more request threads only add
+context switches; one loop keeps latency predictable and memory per connection tiny. The request
+connection runs all SQL; the checkpoint connection runs PASSIVE checkpoints off the request thread.
+`locking_mode=NORMAL` lets both connections open the same database.
 
 ```
       io_uring completion queue
@@ -133,7 +134,7 @@ the pass boundary. `locking_mode=EXCLUSIVE` keeps any other process or connectio
         │   │
  jwt.nim│   │jsonbuf.nim  byte-level JSON writer
         ▼   ▼
-      db.nim ── sqlite3.nim (raw C API) ── in-process SQLite (WAL, one connection)
+      db.nim ── sqlite3.nim (raw C API) ── in-process SQLite (WAL, request + checkpoint connections)
               │
               ▼
       one SEND per drained output buffer  (backpressure / registered-fd send)
@@ -141,11 +142,11 @@ the pass boundary. `locking_mode=EXCLUSIVE` keeps any other process or connectio
 
 | File | Responsibility |
 |---|---|
-| `src/server.nim` | the io_uring loop: multishot accept/recv, provided-buffer pool, registered fds, group commit, pass-boundary checkpoint call; also the socket scaffold (`raiseNofile`, `setupListenSocket`, `processRequests`) |
+| `src/server.nim` | the io_uring loop: multishot accept/recv, provided-buffer pool, registered fds, group commit, checkpoint worker startup; also the socket scaffold (`raiseNofile`, `setupListenSocket`, `processRequests`) |
 | `src/http.nim` | transport-agnostic HTTP/1.1 request parsing + response framing |
 | `src/iouring.nim` | self-contained raw io_uring bindings (no liburing) |
 | `src/api.nim` | routing + the five endpoints + exact error semantics |
-| `src/db.nim` | all SQL; prepared statements; pragmas; read/write lifecycle; inline WAL checkpoint |
+| `src/db.nim` | all SQL; prepared statements; pragmas; read/write lifecycle; off-loop WAL checkpoint lifecycle |
 | `src/sqlite3.nim` | minimal raw `{.importc.}` bindings to the vendored SQLite C API |
 | `src/jwt.nim` | base64url + HS256 HMAC verification (nimcrypto), constant-time compare |
 | `src/jsonbuf.nim` | byte-level JSON writing and minimal request-body parsing |
@@ -157,7 +158,8 @@ the pass boundary. `locking_mode=EXCLUSIVE` keeps any other process or connectio
 and body straight into the connection's pooled output buffer; every other response is framed into that
 buffer by `http.nim`. Sends are submitted until the socket would block; anything left is drained on
 the next completion so a slow reader can never stall the loop. At the end of the pass, after the write
-batch COMMIT and `endRead`, the loop may run one inline RESTART checkpoint.
+batch COMMIT and `endRead`, the request loop never checkpoints: the WAL hook wakes the dedicated
+checkpoint thread, which runs PASSIVE checkpoints.
 
 ### Event-loop invariants
 - **Read to EAGAIN.** Each recv keeps consuming until `EAGAIN`. In multishot mode the same op stays
@@ -174,9 +176,11 @@ batch COMMIT and `endRead`, the loop may run one inline RESTART checkpoint.
   retried through events, never in a busy loop.
 - **Backpressure.** Unflushed output stays buffered and its send is re-submitted until the socket
   accepts it, so an already-writable socket is never missed.
-- **Pass-boundary checkpoint.** The WAL hook only records the WAL frame count. After the pass commit
-  and `endRead`, with every statement reset, `maybeCheckpoint` runs one `SQLITE_CHECKPOINT_RESTART`
-  when the count is at least 4096. A busy result leaves the count in place for the next pass.
+- **Off-loop checkpoint.** The WAL hook only raises an atomic flag and writes an eventfd; it makes no
+  SQLite call. A dedicated checkpoint connection on its own pthread runs one `SQLITE_CHECKPOINT_PASSIVE`
+  per interval. PASSIVE never waits for the request connection's snapshot, so the request thread never
+  performs checkpoint I/O. The WAL may grow during a saturated run; that disk cost is preferred over a
+  multi-second tail-latency stall.
 - **Resource guards.** 16 KiB max header block; 1 MiB max unparsed input; idle 75 s / stalled 30 s.
 - **Sparse slot-indexed state.** Per-connection state is a small pooled `Conn` slot, indexed by the
   fixed-file slot the socket occupies. The `Conn` array reserves the table's full capacity at startup
@@ -229,12 +233,13 @@ The current 64k and k6 measurements are recorded in
   accept stays enabled.
 
 **Data path**
-- **One request connection, statements prepared once.** There is one SQLite connection for the whole
-  process. Statements use `SQLITE_PREPARE_PERSISTENT`; SQL never re-parses, and `SQLITE_ENABLE_QPSG`
-  keeps statement behavior stable if a statement is ever re-prepared.
+- **One request connection, statements prepared once.** The request connection runs every query. The
+  checkpointer owns a second connection on its own pthread. Statements use `SQLITE_PREPARE_PERSISTENT`;
+  SQL never re-parses, and `SQLITE_ENABLE_QPSG` keeps statement behavior stable if a statement is ever
+  re-prepared.
 - **One read transaction per pass.** The first read of an event-loop pass opens a single
   `BEGIN DEFERRED`; every read in that pass runs inside it, and `endRead` COMMITs at the pass boundary,
-  so no stale snapshot survives a pass. The inline checkpoint runs after that COMMIT.
+  so no stale snapshot survives a pass. The checkpoint worker runs off-loop after the commit.
 - **Top-20 feed ids plus rowid range.** The feed first reads the top-20 ids through the `created_at`
   index. Likes are counted inside that id window, and the rows are fetched with a plain rowid range,
   `id BETWEEN ? AND ?`, with no `ORDER BY` or `INDEXED BY`. Each row is written into a reusable
@@ -258,13 +263,13 @@ The current 64k and k6 measurements are recorded in
   place. The only heap allocation is the decoded `username`, which is response data.
 - **mmap plus a small page cache.** Reads come from the OS page cache (size via `SQLITE_MMAP_SIZE`,
   default 1 GiB); the SQLite page cache is deliberately tiny at `cache_size=-64` (64 KiB).
-- **Inline WAL checkpoint.** Autocheckpoint is disabled (`wal_autocheckpoint=0`). The single
-  connection runs `locking_mode=EXCLUSIVE`, and the library is compiled `SQLITE_THREADSAFE=0`. The
-  WAL hook only records the frame count. At the process-wide pass boundary, after the pass COMMIT and
-  `endRead`, the loop runs one `SQLITE_CHECKPOINT_RESTART` when the count reaches 4096 frames. RESTART
-  copies the frames back and rewinds the WAL, so the file stays around 16 MiB instead of growing. A
-  busy checkpoint is retried on a later pass, never in a spin. The inline checkpoint uses the request
-  connection and runs on the request thread.
+- **Off-loop WAL checkpoint.** Autocheckpoint is disabled (`wal_autocheckpoint=0`). The request
+  connection uses `locking_mode=NORMAL`; the library is compiled `SQLITE_THREADSAFE=2`. The WAL hook
+  only raises an atomic flag and writes an eventfd. A separate checkpoint connection on a dedicated
+  pthread runs `SQLITE_CHECKPOINT_PASSIVE` (coalesced to about once per second). PASSIVE copies what it
+  can without waiting for readers, so it never blocks the writer. The WAL can grow during a saturated
+  run (measured 92-104 MiB at 64k); `journal_size_limit=67108864` bounds it at a quiet point. This
+  trade is deliberate: bounded request latency over a larger WAL.
 - **Write group commit** (default on): writes issued during one event-loop pass share a single
   transaction that commits before any dependent response is sent (`synchronous=NORMAL`, the documented
   floor the rules allow).
@@ -286,7 +291,7 @@ The current 64k and k6 measurements are recorded in
 - **Profile-guided optimization (PGO)**: a two-pass build trained on a short synthetic workload, with a
   plain-build fallback when PGO is unavailable.
 - **Native + LTO + SQLite trims**: `-O3 -march=native -fno-semantic-interposition -fno-plt
-  --stacktrace:off` and `-d:lto`, with SQLite compiled single-threaded (`SQLITE_THREADSAFE=0`,
+  --stacktrace:off` and `-d:lto`, with SQLite compiled multi-threaded (`SQLITE_THREADSAFE=2`,
   `HAVE_FDATASYNC=1`) and trimmed (`USE_ALLOCA=1`, `LIKE_DOESNT_MATCH_BLOBS`, `OMIT_DECLTYPE`,
   `OMIT_AUTOINIT`, `OMIT_*`, `DQS=0`, JSON1). See [Build](#build).
 
@@ -363,10 +368,10 @@ The server is built so that a request cannot crash it and every per-event operat
 ## Durability
 
 `WAL` + `synchronous=NORMAL`. A `201` means the row is committed before the response is written. The
-inline RESTART checkpoint runs only after the pass commit, so it never checkpoints past a live read
-snapshot. `NORMAL` survives a process crash; on power loss the newest committed transactions may be
-lost while the database stays uncorrupted. `synchronous=OFF` (which can corrupt the file) is not used.
-Durability was verified with a 3,000-post SIGTERM and reopen check.
+checkpoint worker runs PASSIVE checkpoints off the request thread, so checkpoint I/O never sits between
+the pass commit and the next request. `NORMAL` survives a process crash; on power loss the newest
+committed transactions may be lost while the database stays uncorrupted. `synchronous=OFF` (which can
+corrupt the file) is not used. Durability was verified with a 3,000-post SIGTERM and reopen check.
 
 ## Build
 
@@ -386,8 +391,8 @@ Durability was verified with a 3,000-post SIGTERM and reopen check.
   42-check suite and the 64k load test pass, and malformed-input fuzzing is advisable.
   `BUILD_VARIANT=control` uses `-d:release` and keeps the checks on. PGO is on by default and runs
   through the same two-pass pipeline for both variants.
-- **SQLite trims:** `-DSQLITE_THREADSAFE=0` (one connection, one thread), `-DHAVE_FDATASYNC=1`,
-  `-DSQLITE_DQS=0`, `-DSQLITE_DEFAULT_MEMSTATUS=0`, `-DSQLITE_USE_ALLOCA=1`,
+- **SQLite trims:** `-DSQLITE_THREADSAFE=2` (request + checkpoint connections on separate threads),
+  `-DHAVE_FDATASYNC=1`, `-DSQLITE_DQS=0`, `-DSQLITE_DEFAULT_MEMSTATUS=0`, `-DSQLITE_USE_ALLOCA=1`,
   `-DSQLITE_LIKE_DOESNT_MATCH_BLOBS`, `-DSQLITE_OMIT_DECLTYPE`, `-DSQLITE_OMIT_AUTOINIT` (with one
   `sqlite3_initialize()` in `openDb`), `-DSQLITE_OMIT_DEPRECATED`, `-DSQLITE_OMIT_LOAD_EXTENSION`,
   `-DSQLITE_OMIT_PROGRESS_CALLBACK`, `-DSQLITE_OMIT_SHARED_CACHE`, `-DSQLITE_MAX_EXPR_DEPTH=0`,
@@ -397,8 +402,8 @@ Durability was verified with a 3,000-post SIGTERM and reopen check.
 
 - `bash test/run.sh submissions/nim-io_uring-NioHast`: the official **42-check** suite, byte-exact.
   It builds `bin/server` and runs it via `start.sh`. All 42 checks pass.
-- Unit tests under `tests/`: `test_db.nim` (queries vs the seed DB, plus the inline-checkpoint unit
-  test: WAL frame threshold, pass-boundary RESTART, busy retry, counter reset and reopen),
+- Unit tests under `tests/`: `test_db.nim` (queries vs the seed DB, plus the off-loop checkpoint unit
+  test: worker startup, PASSIVE run, error-free counters, data persistence, worker thread and reopen),
   `test_jwt.nim` (HS256 against `openssl` vectors), `test_iouring.nim` (io_uring ABI + SQE/CQE
   round-trip), `test_body.nim` (request-body parsing and its `std/json` fallback),
   `test_jsonbuf.nim` (JSON writing and escaping), `test_feed_writer.nim` (direct feed serialization,
@@ -412,14 +417,14 @@ Durability was verified with a 3,000-post SIGTERM and reopen check.
   variants under the churn/feed harnesses), and `multiring_smoke.sh` (the multi-ring completion-wake
   regression and pipelined mixed write).
 - **Durability:** a 3,000-post SIGTERM and reopen check confirmed that committed rows survive the
-  restart. The commit-failure harness is not applicable to the `EXCLUSIVE` single-connection
-  design; the 42-check suite is the CI gate.
+  restart. The commit-failure harness is not part of this run; the 42-check suite is the CI gate.
 - The two correctness gates are the **42/42** official suite and the **7/7** feed-equality harness.
 
 ## Compliance (challenge rules)
 
 - **SQLite only**: every read/write is in-process SQLite (rule 2); no in-memory store, no external
-  cache. There is exactly one SQLite connection, owned by the request thread.
+  cache. The request thread owns the request connection; a dedicated checkpoint pthread owns the
+  second connection, which only runs PASSIVE checkpoints.
 - **No caching across requests** (rule 5): no response cache, no query cache, and no in-memory copy
   of any table. Every request reads SQLite; the only state reused across requests is SQLite's own
   page cache (`cache_size=-64`, 64 KiB), the OS page cache through `mmap_size=1 GiB`, and prepared

@@ -12,9 +12,10 @@ what happens if it is missing. See [README](../README.md) for build/run and
 
 `ldd bin/server` shows just `libc.so.6` (plus the loader/vdso): SQLite is compiled
 in-tree, the Nim thread runtime is off, there is no `dlopen`, and libm is folded into
-glibc. The server runs one request thread with one SQLite connection, and the inline
-checkpoint runs on that thread, so no POSIX pthread worker is created and no extra
-shared library appears. The binary runs on any Ubuntu 24.04.
+glibc. The server runs one request thread plus one raw POSIX checkpoint pthread with
+its own SQLite connection; the checkpoint worker is created with `pthread_create`, so
+no Nim thread runtime is linked and no extra shared library appears. The binary runs
+on any Ubuntu 24.04.
 
 ## Build: pinned downloads (URL + sha256)
 

@@ -16,10 +16,18 @@ import nimcrypto
 import http
 
 type
-  JwtStatus* = enum jsOk, jsInvalid, jsBadPayload
+  ## Final verification result. A bad signature, malformed token or expired
+  ## token is `jsInvalid`; only a verified token with unusable claims is
+  ## `jsBadPayload`.
+  JwtStatus* = enum
+    jsOk
+    jsInvalid
+    jsBadPayload
+
+  ## Authenticated identity extracted from a verified payload.
   JwtInfo* = object
-    userId*: int64
-    username*: string
+    userId*: int64      ## `sub`, decoded as a positive int64
+    username*: string   ## `username`, decoded from its JSON string
 
 const
   ## Base64 of the largest possible token in a 16 KiB header block is
@@ -32,9 +40,12 @@ const
   ## directly skips the std/json header parse on the hot path.
   Hs256Header* = """{"alg":"HS256","typ":"JWT"}"""
 
-  JsonDepthLimit = 1000
+  JsonDepthLimit = 1000  ## bound recursive payload scanning to protect the stack
 
 type
+  ## Fixed verification workspace for one token. `decoded` is reused for the
+  ## header and then the payload, while `sig` holds the decoded HMAC so the two
+  ## never overlap. Both are fixed-size, so verification cannot allocate or grow.
   JwtScratch = object
     decoded: array[JwtScratchCap, char]
     sig: array[32, char]
@@ -104,6 +115,9 @@ proc parseHeaderFallback(dec: openArray[char]; n: int): bool =
   true
 
 proc headerIsCanonical(dec: openArray[char]; n: int): bool {.inline.} =
+  ## Byte-exact fast path for the header emitted by the official generator.
+  ## Any other valid header shape (key order, whitespace, extra keys) is left to
+  ## `parseHeaderFallback`, so acceptance stays identical to std/json.
   if n != Hs256Header.len: return false
   for i in 0 ..< n:
     if dec[i] != Hs256Header[i]: return false
@@ -118,14 +132,20 @@ proc headerIsCanonical(dec: openArray[char]; n: int): bool {.inline.} =
 # same verdict, while extracting `exp`/`sub`/`username` with last-key-wins.
 
 type
+  ## Cursor over the decoded payload. The buffer is borrowed from `JwtScratch`;
+  ## `err` is sticky so callers can check it once after a recursive descent.
   JsonScan = object
     buf: ptr UncheckedArray[char]
     len: int
     pos: int
     err: bool
 
+  ## JSON categories that matter when extracting `exp`, `sub` and `username`.
+  ## Numbers that std/json would keep as a raw string are `vkOther`.
   ValKind = enum vkOther, vkInt, vkFloat, vkString
 
+  ## One scanned value. `i`/`f` are valid only for the matching kind; strings
+  ## carry their raw (still escaped) span so the caller can decode or compare it.
   ValInfo = object
     kind: ValKind
     i: int64
@@ -133,20 +153,26 @@ type
     sStart: int
     sEnd: int
 
+  ## Captured claim type. `fkOther` means the key was present with an unusable
+  ## JSON type; `fkMissing` means it was never seen.
   FieldKind = enum fkMissing, fkInt, fkFloat, fkString, fkOther
 
+  ## Last-key-wins claim state built while scanning the top-level object.
   PayloadState = object
     expKind: FieldKind
     expVal: float
     subKind: FieldKind
-    subOk: bool
+    subOk: bool          ## `sub` decoded to a positive int64 digit string
     subVal: int64
     userKind: FieldKind
-    userStart: int
+    userStart: int       ## raw span of the `username` JSON string
     userEnd: int
 
 proc emitChar(outBuf: ptr UncheckedArray[char]; outCap: int;
               outLen: var int; c: char) {.inline.} =
+  ## Append one decoded byte when there is room, but always count it. The count
+  ## can therefore exceed `outCap`; `scanObject` uses that to recognize a key
+  ## longer than its fixed scratch buffer without allocating.
   if outLen < outCap:
     outBuf[outLen] = c
   inc outLen
@@ -301,12 +327,17 @@ proc scSkip(js: var JsonScan) =
     else:
       return
 
+# These three procs are mutually recursive: `scanValue` dispatches on the first
+# byte, and container values recurse through `scanObject`/`scanArray`. `depth`
+# is the current nesting level; `capture` is true only for the top-level object.
 proc scanValue(js: var JsonScan; depth: int): ValInfo
 
 proc scanObject(js: var JsonScan; depth: int; st: var PayloadState;
                 capture: bool)
 
 proc scanArray(js: var JsonScan; depth: int) =
+  ## Validate an array and discard its values. Arrays cannot supply claims, but
+  ## their contents still have to be parsed to find the closing bracket.
   inc js.pos
   js.scSkip
   if js.err: return
@@ -339,6 +370,9 @@ proc scanArray(js: var JsonScan; depth: int) =
       return
 
 proc scanNumber(js: var JsonScan): ValInfo =
+  ## Consume one JSON number token using std/json's permissive grammar, then
+  ## require the whole token to convert. Overflowing or otherwise non-numeric
+  ## tokens still validate as `vkOther`, matching std/json's raw-string fallback.
   let start = js.pos
   if js.pos < js.len and js.buf[js.pos] == '-': inc js.pos
   var isFloat = false
@@ -385,6 +419,7 @@ proc scanNumber(js: var JsonScan): ValInfo =
       result.i = v
 
 proc feedDigit(v: var int64; c: char; ok: var bool) {.inline.} =
+  ## Append one decimal digit, clearing `ok` instead of overflowing int64.
   let d = int64(ord(c) - ord('0'))
   if v > (9_223_372_036_854_775_807'i64 - d) div 10:
     ok = false
@@ -508,6 +543,11 @@ proc decodeStringAlloc(js: var JsonScan; a, b: int): string =
 
 proc scanObject(js: var JsonScan; depth: int; st: var PayloadState;
                 capture: bool) =
+  ## Validate an object and, when `capture` is true, record `exp`, `sub` and
+  ## `username`. Keys are decoded into a small fixed buffer; only exact short
+  ## names are recognized, so an arbitrarily long key is validated but ignored.
+  ## A repeated key overwrites the earlier value, matching std/json's
+  ## last-key-wins lookup.
   inc js.pos
   js.scSkip
   if js.err: return
@@ -583,6 +623,9 @@ proc scanObject(js: var JsonScan; depth: int; st: var PayloadState;
       return
 
 proc scanValue(js: var JsonScan; depth: int): ValInfo =
+  ## Validate one JSON value. A string returns its raw escaped span; objects and
+  ## arrays are recursively validated but their contents are never captured.
+  ## `depth` bounds recursion so a malicious payload cannot exhaust the stack.
   js.scSkip
   if js.err or js.pos >= js.len:
     js.err = true
@@ -634,6 +677,9 @@ proc scanValue(js: var JsonScan; depth: int): ValInfo =
 
 proc scanPayload(buf: ptr UncheckedArray[char]; n: int;
                  st: var PayloadState): bool =
+  ## Scan a decoded payload and capture its claims. The top level must be an
+  ## object. Comments, trailing commas and a trailing NUL are accepted exactly
+  ## where std/json accepts them; anything else after the object is invalid.
   var js = JsonScan(buf: buf, len: n, pos: 0)
   js.scSkip
   if js.err or js.pos >= js.len or js.buf[js.pos] != '{':
@@ -650,6 +696,11 @@ proc scanPayload(buf: ptr UncheckedArray[char]; n: int;
 
 proc verifyJwtImpl(buf: openArray[char]; token: Span; secret: string;
                    now: float): tuple[status: JwtStatus, info: JwtInfo] =
+  ## Verify a compact HS256 token borrowed from `buf`.
+  ##
+  ## Structural, encoding, signature and expiry failures are `jsInvalid`. Once
+  ## the signature is known good, only unusable `sub`/`username` claims produce
+  ## `jsBadPayload`, so the caller can return the frozen 401 bodies distinctly.
   result = (jsInvalid, JwtInfo())
 
   # 1. Exactly three dot-separated segments.

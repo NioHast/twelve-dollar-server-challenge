@@ -45,15 +45,18 @@ type
     off*: int
     len*: int
 
+  ## Parsed request-line and header fields, all borrowed from the caller's
+  ## buffer. `ok` covers syntax; `bad` records a framing rejection that must be
+  ## answered with 400 rather than retried as a body.
   HeadInfo* = object
     ok*:            bool
     ## Set when the request is syntactically a request but its framing is
     ## non-conforming (bad/conflicting Content-Length, Transfer-Encoding): the
     ## caller answers 400 and closes instead of re-parsing the body as a request.
     bad*:           bool
-    httpMethod*:    Span
-    path*:          Span
-    auth*:          Span
+    httpMethod*:    Span ## request method, without the trailing space
+    path*:          Span ## path only; the query string is already removed
+    auth*:          Span ## raw Authorization value, if present
     keepAlive*:     bool
     contentLen*:    int
     sawContentLen*: bool
@@ -82,12 +85,14 @@ proc spanEqIgnoreCase*(buf: openArray[char]; s: Span; lit: string): bool {.inlin
   true
 
 proc spanStartsWith*(buf: openArray[char]; s: Span; lit: string): bool {.inline.} =
+  ## Exact, case-sensitive prefix test against a literal.
   if s.len < lit.len: return false
   for i in 0 ..< lit.len:
     if buf[s.off + i] != lit[i]: return false
   true
 
 proc spanEndsWith*(buf: openArray[char]; s: Span; lit: string): bool {.inline.} =
+  ## Exact, case-sensitive suffix test against a literal.
   if s.len < lit.len: return false
   let base = s.off + s.len - lit.len
   for i in 0 ..< lit.len:

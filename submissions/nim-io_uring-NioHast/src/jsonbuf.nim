@@ -116,6 +116,8 @@ proc addEscaped*(buf: var string, s: string) =
     addEscapedRaw(buf, cast[ptr UncheckedArray[char]](unsafeAddr s[0]), s.len)
 
 proc addJStr*(buf: var string, s: string) =
+  ## Append `s` as a complete JSON string, including both quotes. The contents
+  ## go through `addEscaped`, so callers never need to pre-escape wire text.
   buf.add '"'
   buf.addEscaped s
   buf.add '"'
@@ -195,7 +197,10 @@ proc addJInt*(buf: var string, v: int64) =
   discard putU64(cast[ptr UncheckedArray[char]](addr buf[pos]), mag)
 
 type BodyKind* = enum
-  bkOk, bkMalformed, bkRequired
+  ## Classification returned by `parseBody`; only `bkOk` carries a usable body.
+  bkOk        ## valid JSON object with a string `body` member
+  bkMalformed ## input is not valid JSON
+  bkRequired  ## valid JSON, but no string `body` member
 
 proc hex4(raw: string, i: var int): int =
   ## Parse four hex digits at `i`; advance `i` on success. Returns -1 when the
@@ -320,7 +325,13 @@ proc parseCanonicalBody*(raw: string, body: var string): bool =
   i == n
 
 proc parseBody*(raw: string): tuple[kind: BodyKind, body: string] =
-  ## bkMalformed -> invalid JSON; bkRequired -> no usable string "body"; bkOk -> decoded body (raw, untrimmed).
+  ## Parse the request body without changing the frozen wire semantics.
+  ##
+  ## The canonical `{"body":"..."}` shape is handled by the in-place scanner;
+  ## every other valid JSON document is parsed with std/json, so duplicate keys,
+  ## comments, trailing data and number/string edge cases keep std/json's exact
+  ## verdict. The returned body is decoded but untrimmed; length and emptiness
+  ## checks belong to the API layer.
   if parseCanonicalBody(raw, result.body):
     result.kind = bkOk
     return result

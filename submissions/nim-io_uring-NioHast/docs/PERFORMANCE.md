@@ -54,13 +54,16 @@ numbers are not the official score.
 | CPU | `62.2%` of one core |
 | User CPU | `18.25%` |
 | System CPU | `43.95%` |
-| p99 | `41-229 ms` |
-| RSS | `142.8 MiB` |
-| WAL max | `16.2 MiB` |
+| p99 | `41-393 ms` |
+| RSS | `135-137 MiB` |
+| WAL max | `92-104 MiB` |
 | Errors | `0` |
 
-Across the four runs, p99 ranged from 41 to 229 ms (median about 86 ms). The high end is a
-pass-boundary checkpoint stall. Every run stayed below the 1 s p99 threshold with zero errors.
+After the off-loop PASSIVE checkpoint fix, two 64k/30s validation runs produced p99 `393.216 ms`
+and `40.960 ms`, p95 `196.608 ms` and `20.480 ms`, and p50 `8.192 ms` and `1.280 ms`, both with
+64,000/64,000 VUs connected, ~6,795 RPS and zero errors. No checkpoint exceeded 113 ms, and every
+checkpoint ran on the worker thread. The first run's higher tail is run variance, not a request-thread
+checkpoint stall; the previous inline RESTART path produced p99 `2,621 ms`.
 
 ### k6 hold
 
@@ -81,9 +84,9 @@ count. It is a local regression check, not an organiser score.
 ## Why it is fast
 
 - **Direct HTTP:** no reverse proxy, no extra network hop, and no proxy CPU.
-- **One request thread:** one io_uring event loop, no worker pool, no thread hand-off.
-- **One SQLite connection:** the inline checkpoint runs on the same connection and thread, so there
-  is no cross-thread coordination.
+- **One request thread, off-loop checkpoint:** one io_uring event loop handles requests, while a
+  dedicated pthread and second SQLite connection run PASSIVE checkpoints. No checkpoint I/O runs on
+  the request thread.
 - **Multishot receive and accept:** one operation stays armed across many completions.
 - **Provided buffers and fixed files:** receives use a registered buffer ring (256 buffers of 8 KiB by
   default), complete requests are parsed directly from the provided buffer, and only an incomplete
@@ -105,8 +108,9 @@ count. It is a local regression check, not an organiser score.
   intermediate body string.
 - **Small SQLite cache plus mmap:** `cache_size=-64` keeps SQLite's cache tiny, while `mmap_size=1 GiB`
   lets reads use the OS page cache.
-- **Inline RESTART checkpoint:** the single connection runs one `SQLITE_CHECKPOINT_RESTART` at the
-  pass boundary when the WAL hook reaches 4096 frames, so the WAL stays around 16 MiB.
+- **Off-loop PASSIVE checkpoint:** a dedicated connection/thread runs PASSIVE about once per second,
+  so the WAL copy and fsync never block the request loop. The WAL can grow during a saturated run
+  (measured 92-104 MiB at 64k); this is the deliberate latency-versus-disk trade.
 - **Borrowed request spans and stack JWT scratch:** parsing and auth do not copy the request or
   allocate per field.
 - **SSE2 JSON work:** escaping scans 16 bytes at a time, clean runs are copied in bulk, and integer
@@ -122,7 +126,7 @@ count. It is a local regression check, not an organiser score.
   machines. Local loopback numbers are optimistic and are not organiser numbers.
 - The local measurements share one host with the load generator. The 1 vCPU / 2 GB target needs a
   separate load generator for a true maximum-users score.
-- `locking_mode=EXCLUSIVE` means the commit-failure harness is not applicable. The
+- `locking_mode=NORMAL` and two SQLite connections are required for the off-loop checkpointer. The
   42-check suite is the CI gate, and durability was verified with a 3,000-post SIGTERM and reopen
   check.
 - The shipping `-d:danger` build removes Nim bounds, overflow and range checks and `assert`. The

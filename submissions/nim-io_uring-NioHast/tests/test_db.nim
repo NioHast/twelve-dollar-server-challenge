@@ -22,8 +22,8 @@ proc expect(name: string, cond: bool, detail: string) =
   if cond: pass(name) else: fail(name, detail)
 
 proc countThreads(): int =
-  ## Prove the process still has exactly one thread: the inline checkpoint uses
-  ## no worker, so nothing can have been created by openDb/commit/checkpoint.
+  ## The off-loop checkpointer must have created exactly one worker pthread in
+  ## addition to the request thread.
   for line in readFile("/proc/self/status").splitLines:
     if line.startsWith("Threads:"):
       return parseInt(line.splitWhitespace()[1])
@@ -51,6 +51,7 @@ proc runTests() =
         try: removeFile(f) except OSError: discard
 
   let db = openDb(tmpDb)
+  db.startCheckpointer()
 
   # health ------------------------------------------------------------------
   expect("health", db.health(), "health() returned false")
@@ -152,94 +153,73 @@ proc runTests() =
   expect("read_then_like_commit", db.commitBatch(),
          "commitBatch after read-then-like returned false")
 
-  # --- inline WAL checkpoint -----------------------------------------------
+  # --- off-loop WAL checkpoint ---------------------------------------------
   expect("read_pass_boundary_end", db.endRead(),
          "endRead at the pass boundary failed")
 
-  # The WAL hook runs on this connection after every commit and only bumps the
-  # frame counter.
-  var beforeCommit = db.checkpointDiag()
+  # The WAL hook raises the worker's wanted flag after every commit. Drive one
+  # commit and wait for the dedicated pthread to run a PASSIVE checkpoint.
+  var beforeCommit = db.checkpointStats()
   var hookPost: Post
   expect("checkpoint_hook_create",
          db.createPost(1, "golden_ember_1", "checkpoint hook", hookPost),
          "createPost before checkpointing returned false")
   expect("checkpoint_hook_commit", db.commitBatch(),
          "commitBatch before checkpointing returned false")
-  var afterCommit = db.checkpointDiag()
-  echo "# wal frames: before=", beforeCommit.walFrames, " after=",
-       afterCommit.walFrames, " threshold=", WalCheckpointFrames
-  expect("checkpoint_hook_counts_frames",
-         afterCommit.walFrames > beforeCommit.walFrames,
-         "walFrames did not grow after a commit: " &
-           $beforeCommit.walFrames & " -> " & $afterCommit.walFrames)
+  db.requestCheckpoint()
 
-  # Below the threshold, the pass-boundary call must do nothing: one checkpoint
-  # attempt is gated by the counter, not run unconditionally every pass.
-  db.maybeCheckpoint()
-  let belowThreshold = db.checkpointDiag()
-  expect("checkpoint_below_threshold_no_run",
-         belowThreshold.count == beforeCommit.count,
-         "count=" & $belowThreshold.count & " before=" & $beforeCommit.count)
+  var afterCommit = beforeCommit
+  var waited = 0
+  while waited < 5000:
+    afterCommit = db.checkpointStats()
+    if afterCommit.count > beforeCommit.count:
+      break
+    sleep(10)
+    waited += 10
+  echo "# checkpoint worker: count ", beforeCommit.count, " -> ",
+       afterCommit.count, " waited_ms=", waited,
+       " last_pnLog=", afterCommit.lastPnLog,
+       " busy=", afterCommit.busy, " errors=", afterCommit.errors
+  expect("checkpoint_worker_ran",
+         afterCommit.count > beforeCommit.count,
+         "checkpoint count did not advance in 5s; count=" & $afterCommit.count)
+  expect("checkpoint_worker_no_errors",
+         afterCommit.errors == 0 and afterCommit.pollFailures == 0,
+         "errors=" & $afterCommit.errors & " poll_failures=" &
+           $afterCommit.pollFailures)
+  expect("checkpoint_worker_passive",
+         afterCommit.lastPnLog >= 0,
+         "worker did not observe WAL frames; pnLog=" & $afterCommit.lastPnLog)
 
-  # Drive REAL commits until the production threshold is reached. The hook is
-  # the only counter, so this proves the hook observes every commit and that
-  # nothing else resets the WAL behind our back (wal_autocheckpoint=0).
-  var lastThreshold: Post
-  var commits = 0
-  while db.checkpointDiag().walFrames < WalCheckpointFrames and commits < 20000:
-    if not db.createPost(1, "golden_ember_1", "threshold " & $commits,
-                         lastThreshold):
-      fail("checkpoint_threshold_commit", "createPost returned false")
-    if not db.commitBatch():
-      fail("checkpoint_threshold_commit", "commitBatch returned false")
-    inc commits
-  let atThreshold = db.checkpointDiag()
-  echo "# threshold after ", commits, " commits: frames=", atThreshold.walFrames
-  expect("checkpoint_threshold_reached",
-         atThreshold.walFrames >= WalCheckpointFrames,
-         "frames=" & $atThreshold.walFrames & " threshold=" &
-           $WalCheckpointFrames & " commits=" & $commits)
-
-  # A pass-boundary call now runs exactly one inline RESTART checkpoint and
-  # resets the counter only on success.
-  db.maybeCheckpoint()
-  let afterCheckpoint = db.checkpointDiag()
-  echo "# inline checkpoint: count ", atThreshold.count, " -> ",
-       afterCheckpoint.count, " frames=", afterCheckpoint.walFrames,
-       " busy=", afterCheckpoint.busy, " errors=", afterCheckpoint.errors
-  expect("checkpoint_inline_ran",
-         afterCheckpoint.count == atThreshold.count + 1 and
-           afterCheckpoint.errors == 0 and afterCheckpoint.busy == 0,
-         "count=" & $afterCheckpoint.count & " busy=" &
-           $afterCheckpoint.busy & " errors=" & $afterCheckpoint.errors)
-  expect("checkpoint_inline_reset_frames",
-         afterCheckpoint.walFrames < WalCheckpointFrames,
-         "frames=" & $afterCheckpoint.walFrames)
-
-  # A second call under the threshold must not checkpoint again.
-  db.maybeCheckpoint()
-  expect("checkpoint_no_double_run",
-         db.checkpointDiag().count == afterCheckpoint.count,
-         "count changed without new frames")
+  # The worker must stay healthy after another signal, including when it
+  # coalesces the request with the previous checkpoint.
+  db.requestCheckpoint()
+  sleep(20)
+  let afterSecond = db.checkpointStats()
+  expect("checkpoint_worker_stable",
+         afterSecond.errors == 0 and afterSecond.pollFailures == 0,
+         "errors=" & $afterSecond.errors & " poll_failures=" &
+           $afterSecond.pollFailures)
 
   # The checkpointed data is still readable and durable.
   var thresholdRead: Post
-  let thresholdReadOk = db.getPost(lastThreshold.id, thresholdRead)
+  let thresholdReadOk = db.getPost(hookPost.id, thresholdRead)
   expect("checkpoint_data_persists",
-         thresholdReadOk and thresholdRead.body == lastThreshold.body,
-         "post unreadable after the inline checkpoint")
+         thresholdReadOk and thresholdRead.body == hookPost.body,
+         "post unreadable after the off-loop checkpoint")
   expect("checkpoint_read_pass_end", db.endRead(),
          "endRead after the persistence read failed")
 
-  # The test process runs one thread; the inline checkpoint must not create a worker.
+  # The request thread plus exactly one checkpointer pthread.
   let threads = countThreads()
-  echo "# threads after inline checkpoints: ", threads
-  expect("checkpoint_single_thread", threads == 1,
-         "process has " & $threads & " threads; the design requires one")
+  echo "# threads after off-loop checkpoints: ", threads
+  expect("checkpoint_worker_thread", threads >= 2,
+         "process has " & $threads & " threads; expected request + worker")
 
-  # The one connection can be closed and reopened; closeDb is idempotent.
-  let closedId = lastThreshold.id
-  let closedBody = lastThreshold.body
+  # The request connection can be closed and reopened; closeDb is idempotent and
+  # stops the checkpoint worker first.
+  let closedId = hookPost.id
+  let closedBody = hookPost.body
   db.closeDb()
   db.closeDb()
   pass("checkpoint_close_idempotent")

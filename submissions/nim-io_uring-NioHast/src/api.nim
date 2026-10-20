@@ -1,18 +1,24 @@
 ## Transport-agnostic request handling: routing, auth ordering, exact error semantics.
 ## Implements the contract in SPEC.md / test/test.sh byte-for-byte.
+##
+## Method/path/auth are borrowed spans into `reqBuf`; `rawBody` is the only
+## separately decoded input. POST routes validate authentication before touching
+## the body or post id, because the contract distinguishes 401 from 400/404.
 import std/[strutils, times]
 import db, jwt, jsonbuf, http
 
 type ApiResponse* = object
+  ## Response data for endpoints whose body is built in this module. The
+  ## transport adds HTTP framing and writes `body` verbatim.
   status*: int
   body*: string
-  ## The server writes this response's body directly into the connection output
-  ## buffer (`db.writeFeedResponse`) because the body is large and would
-  ## otherwise be built as a throwaway string and copied. `body` is empty when
-  ## this is set. Every other endpoint leaves it false and uses `body`.
+  ## When true, `body` is empty and the transport writes the feed body directly
+  ## into the connection output buffer. This avoids building and copying a large
+  ## intermediate string for the feed endpoint.
   feedDirect*: bool
 
 const
+  # Exact wire bodies. Wording and spacing are part of the challenge contract.
   ErrNotFound     = """{"error":"not found"}"""
   ErrInvalidId    = """{"error":"invalid post id"}"""
   ErrPostNotFound = """{"error":"post not found"}"""
@@ -26,8 +32,12 @@ const
 
 # --- uptime support (shared across threads) ---
 var gStartTime {.global.}: float
-proc markStart*() = gStartTime = epochTime()
+proc markStart*() =
+  ## Record the process start instant before worker threads begin serving.
+  gStartTime = epochTime()
+
 proc uptimeSeconds*(): int64 =
+  ## Whole seconds since `markStart`; the health payload uses the floored value.
   let now = epochTime()
   int64(now - gStartTime)
 
@@ -54,13 +64,18 @@ proc parsePositiveId(buf: openArray[char]; s: Span): tuple[ok: bool, id: int64] 
   (true, v)
 
 type
+  ## Authentication outcome, kept separate from HTTP status so the 401 body is
+  ## selected in exactly one place.
   AuthKind = enum akMissing, akInvalid, akBadPayload, akOk
+
   Auth = object
     kind: AuthKind
     userId: int64
     username: string
 
 proc doAuth(buf: openArray[char]; authHeader: Span; secret: string): Auth =
+  ## Require the literal `Bearer ` scheme and verify the remaining token span.
+  ## The prefix is case-sensitive; anything without it is reported as missing.
   if not spanStartsWith(buf, authHeader, "Bearer "):
     return Auth(kind: akMissing)
   let token = subSpan(authHeader, 7, authHeader.len)
@@ -71,6 +86,8 @@ proc doAuth(buf: openArray[char]; authHeader: Span; secret: string): Auth =
   of jsBadPayload: Auth(kind: akBadPayload)
 
 proc authResponse(a: Auth): ApiResponse =
+  ## Map an auth failure to its frozen 401 body. `akOk` is a sentinel and must
+  ## never reach this proc.
   case a.kind
   of akMissing:    jsonRes(401, ErrMissingBearer)
   of akInvalid:    jsonRes(401, ErrInvalidToken)
@@ -80,6 +97,12 @@ proc authResponse(a: Auth): ApiResponse =
 proc handleRequest*(database: Db; jwtSecret: string; reqBuf: openArray[char];
                     httpMethod, path, authHeader: Span;
                     rawBody: string): ApiResponse =
+  ## Dispatch one parsed request to the matching handler.
+  ##
+  ## Routes: GET /health, GET /feed, GET /posts/:id, POST /posts, and
+  ## POST /posts/:id/like. GET responses have no auth requirement. POST routes
+  ## authenticate first, then validate the body or post id; unknown methods and
+  ## paths fall through to the frozen 404 body.
   if spanEq(reqBuf, httpMethod, "GET"):
     if spanEq(reqBuf, path, "/health"):
       if database.health():

@@ -1715,17 +1715,13 @@ proc runLoop(r: var RingCtx) =
     # End the pass's read snapshot HERE: after the write commit (which already
     # ended it for a read->write pass). A read transaction must never survive a
     # pass, otherwise the connection would keep reading a stale snapshot and the
-    # inline RESTART checkpoint could not rewind the WAL.
+    # checkpointer could not backfill the frames it still covers.
+    #
+    # The WAL checkpoint is NOT run here. It lives on its own connection/thread
+    # (started below) and is driven by the WAL hook, so this loop never performs
+    # checkpoint I/O: no page copy and no fsync on the request thread.
     if gDb != nil and not gDb.endRead():
       stderr.writeLine("db: COMMIT of the pass read transaction failed")
-
-    # Inline checkpoint at the pass boundary, after the commit and after the
-    # read snapshot is closed. The WAL hook counts frames; maybeCheckpoint only
-    # does work once WalCheckpointFrames have accumulated, and one attempt per
-    # pass is enough (SQLITE_BUSY leaves the counter for the next pass). This is
-    # the only checkpoint path: there is no checkpoint connection or thread.
-    if gDb != nil:
-      gDb.maybeCheckpoint()
 
     # Buffers returned during this pass may have un-starved recvs that hit
     # -ENOBUFS earlier in the same pass.
@@ -1954,12 +1950,8 @@ proc runMultiLoop(rings: var seq[RingCtx]) =
     if gDb != nil and not gDb.endRead():
       stderr.writeLine("db: COMMIT of the pass read transaction failed")
 
-    # Inline checkpoint at the process-wide pass boundary, after the commit and
-    # after the read snapshot is closed (one connection is shared by every ring;
-    # all rings are drained before this point).
-    if gDb != nil:
-      gDb.maybeCheckpoint()
-
+    # The checkpointer runs on its own connection/thread; the process-wide
+    # pass boundary performs no checkpoint I/O.
     # Buffers returned during this pass may have un-starved recvs that hit
     # -ENOBUFS earlier in the same pass. Per ring: the pools are not shared.
     for i in 0 ..< rings.len:
@@ -2210,12 +2202,15 @@ proc main() =
     gRings[i].freeTop = 0
 
   # ---- database -----------------------------------------------------------
-  # ONE connection, owned by the ONE request thread. The WAL hook counts frames
-  # and the event loop runs RESTART checkpoints inline at its pass boundary.
+  # One request connection owned by the request thread, plus the dedicated
+  # checkpoint connection/thread. From here on every commit raises the WAL
+  # hook's atomic flag and the worker runs PASSIVE checkpoints; the request
+  # loop never checkpoints.
   gDb = openDb(cfg.sqlitePath)
   # Write batching across one completion-queue pass; GROUP_COMMIT=0 restores
   # autocommit. Default ON.
   gDb.setGroupCommit(groupCommitEnabled())
+  gDb.startCheckpointer()
   markStart()
 
   let recvStr = if recvMultishot: "multishot" else: "oneshot"
