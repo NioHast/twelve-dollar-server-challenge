@@ -914,9 +914,9 @@ proc flushBufTail(r: var RingCtx) {.inline.} =
   ## during this pass. poolPush only writes descriptors and bumps bufTail; the
   ## single tail store happens here, before the next enter can submit a recv.
   if r.useBufRing and r.bufTailPending:
-    # Descriptor fields are visible before tail on x86 (stores are ordered) and
-    # the kernel loads the tail with acquire semantics.
-    r.bufRing[0].resv = r.bufTail
+    # Publish the descriptor tail after all descriptor writes. x86 gets this
+    # ordering from TSO; ARM64 uses a release store.
+    storeReleaseU16(addr r.bufRing[0].resv, r.bufTail)
     r.bufTailPending = false
 
 proc mustSqe(r: var RingCtx): ptr Sqe =
@@ -1653,7 +1653,7 @@ proc drainCompletions(r: var RingCtx): int =
     try:
       discard r.ring.enterGetEvents()
     except IoRingError as ex:
-      if ex.errno == EINTR:
+      if ex.errCode == EINTR:
         continue
       stderr.writeLine("io_uring_enter failed: " & ex.msg)
       quit(1)
@@ -1693,7 +1693,7 @@ proc runLoop(r: var RingCtx) =
         # Idle (or completions already waiting): block for one completion.
         discard r.ring.submitAndWait(1)   # flush reserved SQEs + block for >=1 CQE
     except IoRingError as ex:
-      if ex.errno == EINTR:
+      if ex.errCode == EINTR:
         continue
       stderr.writeLine("io_uring_enter failed: " & ex.msg)
       quit(1)
@@ -1906,7 +1906,7 @@ proc runMultiLoop(rings: var seq[RingCtx]) =
         try:
           discard rings[i].ring.submit()
         except IoRingError as ex:
-          if ex.errno == EINTR:
+          if ex.errCode == EINTR:
             continue
           stderr.writeLine("io_uring_enter failed: " & ex.msg)
           quit(1)
@@ -1929,7 +1929,7 @@ proc runMultiLoop(rings: var seq[RingCtx]) =
       try:
         discard rings[i].ring.enterGetEvents()
       except IoRingError as ex:
-        if ex.errno == EINTR:
+        if ex.errCode == EINTR:
           continue
         stderr.writeLine("io_uring_enter failed: " & ex.msg)
         quit(1)
@@ -2060,7 +2060,7 @@ proc setupRingRetry(flags: uint32): Ring =
       return setupQueue(RingEntries, flags,
                         cuint(RingEntries * CqMultiple))
     except IoRingError as ex:
-      if ex.errno == ENOMEM and tries < 40:
+      if ex.errCode == ENOMEM and tries < 40:
         inc tries
         sleep(50)
         continue

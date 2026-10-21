@@ -22,6 +22,12 @@ healthy well within the 60 s the rules allow.
 | Database | **SQLite 3.54.0**, vendored amalgamation compiled in-tree through hand-written raw `{.importc.}` bindings in `src/sqlite3.nim`; **no system `libsqlite3`** |
 | Serving | the single binary binds **directly on `:80`**; no reverse proxy |
 
+**Architectures:** the official target is Ubuntu 24.04 x86_64. The same source also
+builds and runs on ARM64 Linux: `install.sh` selects the matching pinned Nim tarball,
+the JSON/header scanners compile to SSE2 on x86_64 and NEON on ARM64 (scalar elsewhere),
+and ring publication uses release/acquire stores on ARM64 while keeping x86's plain
+loads/stores.
+
 ## Documentation
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: the event loop, modules, request lifecycle, invariants and connection limits.
@@ -375,7 +381,7 @@ corrupt the file) is not used. Durability was verified with a 3,000-post SIGTERM
 
 ## Build
 
-- **Toolchain:** pinned Nim `2.2.12` binary tarball (sha256-verified in `install.sh`).
+- **Toolchain:** pinned Nim `2.2.12` binary tarball (sha256-verified in `install.sh`; x86_64 and ARM64 assets).
 - **One binary:** `build.sh` builds `bin/server` from `src/server.nim`. PGO is preferred; a failed PGO
   pass falls back to the plain build, and a genuine compile failure is fatal.
 - **SQLite:** the `3.54.0` amalgamation is downloaded by `build.sh` (sha256-verified, `curl --retry 3`)

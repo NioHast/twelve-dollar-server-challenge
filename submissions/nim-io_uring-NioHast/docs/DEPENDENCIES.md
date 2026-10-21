@@ -8,20 +8,20 @@ what happens if it is missing. See [README](../README.md) for build/run and
 
 | Dependency | Role | Source | Pinned? |
 |---|---|---|---|
-| `libc` (glibc) | the only shared library the server links | Ubuntu 24.04 base | fixed by the OS release |
+| `libc` (glibc) | the only shared library the server links | Ubuntu 24.04 base (x86_64 or arm64) | fixed by the OS release |
 
 `ldd bin/server` shows just `libc.so.6` (plus the loader/vdso): SQLite is compiled
 in-tree, the Nim thread runtime is off, there is no `dlopen`, and libm is folded into
 glibc. The server runs one request thread plus one raw POSIX checkpoint pthread with
 its own SQLite connection; the checkpoint worker is created with `pthread_create`, so
 no Nim thread runtime is linked and no extra shared library appears. The binary runs
-on any Ubuntu 24.04.
+on Ubuntu 24.04 x86_64 and ARM64.
 
 ## Build: pinned downloads (URL + sha256)
 
 | Dependency | Role | Version | Verified |
 |---|---|---|---|
-| Nim toolchain | compiles the server (`install.sh`, into `/opt/nim`) | 2.2.12 | sha256 |
+| Nim toolchain | compiles the server (`install.sh`, into `/opt/nim`); architecture-matched x86_64/ARM64 tarball | 2.2.12 | sha256 |
 | SQLite amalgamation | the database, compiled in-tree by `build.sh` | 3.54.0 | sha256 |
 | nimcrypto | HMAC-SHA256 for `src/jwt.nim`, vendored by `build.sh` | 0.7.3 | sha256 |
 
@@ -56,9 +56,9 @@ linked into the server. The build does not use a user Nimble directory;
 ## C headers referenced
 
 `<sys/socket.h>`, `<netinet/tcp.h>`, `<errno.h>`, `<unistd.h>`, `<sys/syscall.h>`,
-`<sys/mman.h>`, `<sys/eventfd.h>`, `<poll.h>`, `<emmintrin.h>` and the
-vendored `<sqlite3.h>`: all from glibc / `linux-libc-dev` (part of `build-essential`)
-and the vendored SQLite. The io_uring structs are hand-mirrored, so
+`<sys/mman.h>`, `<sys/eventfd.h>`, `<poll.h>`, `<emmintrin.h>` (x86_64) or
+`<arm_neon.h>` (ARM64), and the vendored `<sqlite3.h>`: all from glibc /
+`linux-libc-dev` (part of `build-essential`) and the vendored SQLite. The io_uring structs are hand-mirrored, so
 `<linux/io_uring.h>` is not included. No extra packages.
 
 ## PGO-specific dependencies and the plain-build safety net

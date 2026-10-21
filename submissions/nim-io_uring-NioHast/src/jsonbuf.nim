@@ -6,6 +6,8 @@
 ## bytes directly into the caller's buffer so a hot response never builds an
 ## intermediate per-element string.
 import std/[json, bitops]
+import ./scan_simd
+useSimdHeader()
 
 const HexDigits = "0123456789abcdef"
 
@@ -31,31 +33,9 @@ proc addRaw(buf: var string, p: ptr UncheckedArray[char],
   buf.setLen(base + n)
   copyMem(addr buf[base], addr p[first], n)
 
-## 16-byte SSE2 clean-run scanner. Baseline x86_64 always has SSE2, so there is
-## no runtime feature dispatch: the intrinsics below are compiled straight into
-## the target binary. One 128-bit unaligned load per block finds all three
-## escape triggers - byte < 0x20, '"' and '\' - and `_mm_movemask_epi8` turns
-## the compares into a 16-bit lane mask.
-##
-## The unsigned "< 0x20" test is `min_epu8(w, 0x1F) == w`: every lane in
-## 0x00..0x1F survives the unsigned minimum unchanged, while 0x20..0xFF become
-## 0x1F and therefore compare unequal. The other two triggers are exact equality.
-{.emit: "#include <emmintrin.h>".}
-
-proc escapeMask16(p: pointer): int {.inline.} =
-  ## Bit k is set iff the k-th byte at `p` is < 0x20, '"' or '\'.
-  ## The caller guarantees that bytes `p[0 ..< 16]` are inside the source span.
-  var m: int
-  {.emit: """
-    {
-      __m128i w = _mm_loadu_si128((const __m128i*)`p`);
-      __m128i ctrl = _mm_cmpeq_epi8(_mm_min_epu8(w, _mm_set1_epi8(0x1F)), w);
-      __m128i quote = _mm_cmpeq_epi8(w, _mm_set1_epi8(0x22));
-      __m128i slash = _mm_cmpeq_epi8(w, _mm_set1_epi8(0x5C));
-      `m` = _mm_movemask_epi8(_mm_or_si128(ctrl, _mm_or_si128(quote, slash)));
-    }
-  """.}
-  m
+## The scanner is selected at compile time: SSE2 on x86_64, NEON on ARM64,
+## scalar elsewhere. It finds a clean 16-byte run in one pass; the caller copies
+## the run in bulk and only handles the trigger bytes scalar.
 
 proc addEscape(buf: var string, c: char) {.inline.} =
   ## Append the JSON escape for `c`, which must be a member of `Escaped`.
@@ -79,10 +59,10 @@ proc addEscapedRaw*(buf: var string, p: ptr UncheckedArray[char], n: int) =
   ## source in place, so callers that hold column text (valid only until the
   ## next step/reset) never copy it into a temporary string first.
   ##
-  ## Clean runs are found 16 bytes at a time with SSE2, then copied in one bulk
-  ## append; only the final < 16 bytes and the bytes following each trigger are
-  ## scanned scalar. The escape sequences are byte-for-byte the canonical JSON
-  ## escapes.
+  ## Clean runs are found 16 bytes at a time with the architecture-selected
+  ## scanner, then copied in one bulk append; only the final < 16 bytes and the
+  ## bytes following each trigger are scanned scalar. The escape sequences are
+  ## byte-for-byte the canonical JSON escapes.
   var runStart = 0
   var i = 0
   if n >= 16:
@@ -92,7 +72,7 @@ proc addEscapedRaw*(buf: var string, p: ptr UncheckedArray[char], n: int) =
       if mask == 0:
         i += 16
         continue
-      let hit = i + countTrailingZeroBits(mask)
+      let hit = i + firstHit(mask)
       if hit > runStart:
         buf.addRaw(p, runStart, hit - 1)
       buf.addEscape p[hit]

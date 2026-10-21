@@ -72,6 +72,48 @@ var SYS_io_uring_enter {.importc, header: "<sys/syscall.h>".}: clong
 var SYS_io_uring_register {.importc, header: "<sys/syscall.h>".}: clong
 
 # ---------------------------------------------------------------------------
+# Ring publication helpers
+#
+# The kernel consumes SQEs after io_uring_enter and publishes CQEs through the
+# CQ tail. x86 gives us the ordering for free (TSO), so the x86 build keeps the
+# original plain loads/stores. Weakly ordered targets need release/acquire
+# semantics around those shared ring fields.
+# ---------------------------------------------------------------------------
+
+when not defined(amd64) and not defined(i386):
+  {.emit: "#include <stdint.h>".}
+
+proc storeReleaseU32*(p: ptr uint32; v: uint32) {.inline.} =
+  ## Publish a userspace-owned ring field after its payload is visible.
+  when defined(amd64) or defined(i386):
+    p[] = v
+  else:
+    {.emit: "__atomic_store_n((uint32_t*)`p`, (uint32_t)`v`, __ATOMIC_RELEASE);".}
+
+proc storeReleaseU16*(p: ptr uint16; v: uint16) {.inline.} =
+  ## Same as storeReleaseU32 for the provided-buffer ring tail.
+  when defined(amd64) or defined(i386):
+    p[] = v
+  else:
+    {.emit: "__atomic_store_n((uint16_t*)`p`, (uint16_t)`v`, __ATOMIC_RELEASE);".}
+
+proc loadAcquireU32*(p: ptr uint32): uint32 {.inline.} =
+  ## Acquire-load a kernel-published ring field before reading its payload.
+  when defined(amd64) or defined(i386):
+    p[]
+  else:
+    var v: uint32
+    {.emit: "`v` = __atomic_load_n((const uint32_t*)`p`, __ATOMIC_ACQUIRE);".}
+    v
+
+proc ringPublishFence*() {.inline.} =
+  ## Order all SQE writes (and the SQ tail store) before io_uring_enter.
+  when defined(amd64) or defined(i386):
+    discard
+  else:
+    {.emit: "__atomic_thread_fence(__ATOMIC_RELEASE);".}
+
+# ---------------------------------------------------------------------------
 # ABI structures: mirrored from <linux/io_uring.h>
 # ---------------------------------------------------------------------------
 
@@ -315,11 +357,13 @@ const
 
 type
   IoRingError* = object of CatchableError
-    errno*: cint
+    errCode*: cint
+    ## `errno` is a macro on glibc targets; keep the field name neutral so the
+    ## generated C remains valid on both x86_64 and ARM64.
 
 proc newIoRingError(op, detail: string, e: cint): ref IoRingError =
   result = newException(IoRingError, op & " failed: errno=" & $e & " (" & detail & ")")
-  result.errno = e
+  result.errCode = e
 
 # ---------------------------------------------------------------------------
 # Ring object
@@ -386,7 +430,7 @@ proc setupQueue*(entries: cuint, flags: uint32 = 0'u32,
   ## always KEEPING the explicit CQ-size request.  `usedFlags`/`flagsDropped`
   ## record which optimisation set actually took effect.
   ##
-  ## Raises `IoRingError` (with `.errno` set) if the kernel refuses the ring
+  ## Raises `IoRingError` (with `.errCode` set) if the kernel refuses the ring
   ## outright, e.g. ENOSYS on a kernel without io_uring or EPERM under seccomp.
   var p: IoUringParams
   var used = flags
@@ -507,7 +551,7 @@ proc getSqe*(r: Ring): ptr Sqe =
   ## IORING_SETUP_NO_SQARRAY the kernel consumes `tail & mask` directly, so the
   ## indirection store is skipped. The SQ tail is advanced either way; the
   ## kernel sees nothing until `submit`/`submitAndWait`.
-  let head = r.sqkHead[]
+  let head = loadAcquireU32(r.sqkHead)
   let tail = r.sqkTail[]
   if (tail - head) >= r.sqkEntries[]:
     return nil
@@ -526,6 +570,7 @@ proc submit*(r: Ring): int =
   ## keeping the count lets a later submit re-flush them instead of leaving them
   ## uncounted and stranded.
   let to = r.toSubmit
+  ringPublishFence()
   let ret = c_syscall(SYS_io_uring_enter, cast[clong](r.fd), cast[clong](to),
                       clong(0), clong(0), clong(0), clong(0))
   if ret < 0:
@@ -539,6 +584,7 @@ proc submitAndWait*(r: Ring, minComplete: cuint = 1): int =
   ## are available (IORING_ENTER_GETEVENTS). `toSubmit` is cleared only on
   ## success so a failed enter leaves the reserved SQEs counted for a re-flush.
   let to = r.toSubmit
+  ringPublishFence()
   let ret = c_syscall(SYS_io_uring_enter, cast[clong](r.fd), cast[clong](to),
                       cast[clong](minComplete),
                       cast[clong](IORING_ENTER_GETEVENTS),
@@ -572,6 +618,7 @@ proc submitAndWaitBatch*(r: Ring, minComplete: cuint, maxUsec: uint64): int =
                                 pad: 0'u32, ts: addr ts)
   let to = r.toSubmit
   let flags = IORING_ENTER_GETEVENTS or IORING_ENTER_EXT_ARG
+  ringPublishFence()
   let ret = c_syscall(SYS_io_uring_enter, cast[clong](r.fd), cast[clong](to),
                       cast[clong](minComplete), cast[clong](flags),
                       cast[clong](addr arg), cast[clong](sizeof(arg)))
@@ -599,6 +646,7 @@ proc enterGetEvents*(r: Ring): int =
   ## `toSubmit` is cleared only on success (like `submit`): a failed enter leaves
   ## the reserved SQEs counted so a later enter re-flushes them.
   let to = r.toSubmit
+  ringPublishFence()
   let ret = c_syscall(SYS_io_uring_enter, cast[clong](r.fd), cast[clong](to),
                       clong(0), cast[clong](IORING_ENTER_GETEVENTS),
                       clong(0), clong(0))
@@ -624,7 +672,7 @@ proc peekCqe*(r: Ring): ptr Cqe =
   ## Return the next completion, or nil if the CQ ring is empty.
   ## The entry stays owned by the kernel until `cqeSeen`.
   let head = r.cqkHead[]
-  let tail = r.cqkTail[]
+  let tail = loadAcquireU32(r.cqkTail)
   if head == tail:
     return nil
   result = cast[ptr Cqe](cast[uint](r.cqes) +
@@ -632,7 +680,7 @@ proc peekCqe*(r: Ring): ptr Cqe =
 
 proc cqeSeen*(r: Ring) =
   ## Consume the completion previously returned by `peekCqe`.
-  inc r.cqkHead[]
+  storeReleaseU32(addr r.cqkHead[], r.cqkHead[] + 1'u32)
 
 proc cqHead*(r: Ring): uint32 {.inline.} =
   ## Current userspace-consumed CQ position.
@@ -640,7 +688,7 @@ proc cqHead*(r: Ring): uint32 {.inline.} =
 
 proc cqTail*(r: Ring): uint32 {.inline.} =
   ## Current kernel-published CQ position.
-  r.cqkTail[]
+  loadAcquireU32(r.cqkTail)
 
 proc cqeAt*(r: Ring; pos: uint32): ptr Cqe {.inline.} =
   ## The CQE at absolute CQ position `pos` (head <= pos < tail). The entry
@@ -651,7 +699,7 @@ proc cqeAt*(r: Ring; pos: uint32): ptr Cqe {.inline.} =
 proc cqeSeenMany*(r: Ring; count: uint32) {.inline.} =
   ## Consume `count` completions in one publish. Draining a whole batch this way
   ## replaces one head store per CQE with one per batch.
-  inc r.cqkHead[], count
+  storeReleaseU32(addr r.cqkHead[], r.cqkHead[] + count)
 
 # ---------------------------------------------------------------------------
 # Fixed files / buffers

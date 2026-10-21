@@ -113,8 +113,8 @@ count. It is a local regression check, not an organiser score.
   (measured 92-104 MiB at 64k); this is the deliberate latency-versus-disk trade.
 - **Borrowed request spans and stack JWT scratch:** parsing and auth do not copy the request or
   allocate per field.
-- **SSE2 JSON work:** escaping scans 16 bytes at a time, clean runs are copied in bulk, and integer
-  formatting uses a two-digit lookup.
+- **SSE2/NEON JSON work:** escaping scans 16 bytes at a time (SSE2 on x86_64, NEON on ARM64),
+  clean runs are copied in bulk, and integer formatting uses a two-digit lookup.
 - **Danger, PGO, LTO, native code:** the shipping build uses `-d:danger`, profile-guided optimisation,
   link-time optimisation, and `-march=native`.
 - **Pooled output buffers:** idle connections hold no receive buffer, and output buffers are returned

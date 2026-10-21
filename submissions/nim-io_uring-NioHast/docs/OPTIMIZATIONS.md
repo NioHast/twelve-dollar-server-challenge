@@ -75,10 +75,10 @@ This document describes the performance design of the server, including build-ti
 | Borrowed request spans | Headers, body, and JWT fields point into the request buffer instead of being copied. | `src/http.nim`, `src/jwt.nim` |
 | Canonical fast paths | The exact official header and body shapes bypass `std/json`; other valid JSON uses the standard parser. | `src/jwt.nim`, `src/http.nim` |
 | Fixed `JwtScratch` | Header, payload, and signature decoding use a fixed stack buffer, avoiding per-request allocations. | `src/jwt.nim` |
-| SSE2 JSON escaper | The escaper scans 16 bytes at a time for quote, backslash, and control characters. | `src/jsonbuf.nim` |
+| SSE2/NEON JSON escaper | The escaper scans 16 bytes at a time for quote, backslash, and control characters; SSE2 on x86_64, NEON on ARM64, scalar elsewhere. | `src/jsonbuf.nim`, `src/scan_simd.nim` |
 | Bulk clean-run copy | Long runs with no escapes are copied in one move instead of byte by byte. | `src/jsonbuf.nim` |
 | Two-digit itoa lookup | Integer formatting writes two decimal digits per step, reducing division and branches. | `src/jsonbuf.nim` |
-| SSE2 CRLF finder | The header terminator is found 16 bytes at a time, with overlap for boundary matches. | `src/http.nim` |
+| SSE2/NEON CRLF finder | The header terminator is found 16 bytes at a time, with overlap for boundary matches; SSE2 on x86_64, NEON on ARM64, scalar elsewhere. | `src/http.nim`, `src/scan_simd.nim` |
 | 128-byte head reserve | The response head and body share one buffer; the body moves into place without a second allocation. | `src/db.nim` |
 | No intermediate response strings | Feed and post bodies are serialised directly into the output buffer. | `src/db.nim`, `src/jsonbuf.nim` |
 | Keep-alive and pipelining | Multiple requests share a connection, and pipelined requests are parsed without per-request connection setup. | `src/http.nim`, `src/server.nim` |

@@ -3,6 +3,7 @@ nimcache/
 # PGO: instrumented/profile-guided object cache and .gcda profile tree,
 # produced by build.sh's two-pass PGO; never committed.
 nimcache-pgo/
+nimcache-arm64/
 pgo-data/
 # vendored SQLite amalgamation: populated by build.sh, never committed
 vendor/

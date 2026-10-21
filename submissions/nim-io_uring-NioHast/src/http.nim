@@ -22,8 +22,9 @@
 ## Keeping all of this in one module keeps the wire bytes independent of the
 ## transport loop.
 
-import std/[bitops]
 import jsonbuf
+import ./scan_simd
+useSimdHeader()
 
 const
   ## Largest header block (request line + headers) accepted before a request is
@@ -212,24 +213,9 @@ proc addResponse*(buf: var string; status: int; body: string; keepAlive: bool) =
   if body.len > 0:
     copyMem(addr buf[pos], unsafeAddr body[0], body.len)
 
-## 16-byte SSE2 scan for the header terminator. Used by the oversized-buffer
-## path, where scanning a multi-megabyte pipelined buffer scalar would be
-## needless: one unaligned load yields the CR and LF lane masks, and shifting
-## them finds a CRLFCRLF starting at any lane 0..12.
-{.emit: "#include <emmintrin.h>".}
-
-proc crlf4Mask16(p: pointer): int {.inline.} =
-  ## Bit k is set iff bytes `p[k ..< k+4]` are "\r\n\r\n".
-  var m: int
-  {.emit: """
-    {
-      __m128i w = _mm_loadu_si128((const __m128i*)`p`);
-      int cr = _mm_movemask_epi8(_mm_cmpeq_epi8(w, _mm_set1_epi8(0x0D)));
-      int lf = _mm_movemask_epi8(_mm_cmpeq_epi8(w, _mm_set1_epi8(0x0A)));
-      `m` = cr & (lf >> 1) & (cr >> 2) & (lf >> 3);
-    }
-  """.}
-  m
+## 16-byte header terminator scan. The implementation is selected at compile
+## time (SSE2 on x86_64, NEON on ARM64, scalar elsewhere), so the oversized
+## pipelined-buffer path does not fall back to a byte loop on either target.
 
 proc findHeaderEnd*(buf: openArray[char]; start = 0): int =
   ## Index of the terminating CRLFCRLF at or after `start`, or -1 when the
@@ -243,7 +229,7 @@ proc findHeaderEnd*(buf: openArray[char]; start = 0): int =
     while i <= vecEnd:
       let m = crlf4Mask16(unsafeAddr buf[i])
       if m != 0:
-        return i + countTrailingZeroBits(m)
+        return i + firstHit(m)
       i += 13
   while i + 3 < n:
     if buf[i] == '\r' and buf[i+1] == '\n' and
