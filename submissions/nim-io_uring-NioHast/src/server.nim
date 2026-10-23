@@ -180,6 +180,14 @@ proc setupListenSocket*(host: string; port, backlog, deferSec: int;
   # effect as a per-connection setsockopt without the per-accept syscall.
   discard posix.setsockopt(SocketHandle(result), posix.IPPROTO_TCP,
                            TCP_NODELAY, addr one, SockLen(sizeof(one)))
+  # Bound inherited kernel socket memory. At 262k+ connections the default
+  # autotuned buffers can consume most of the 2 GiB cgroup; HTTP requests are
+  # small and feed responses fit comfortably in a modest send buffer.
+  var sockBuf: cint = 32768
+  discard posix.setsockopt(SocketHandle(result), posix.SOL_SOCKET,
+                           posix.SO_RCVBUF, addr sockBuf, SockLen(sizeof(sockBuf)))
+  discard posix.setsockopt(SocketHandle(result), posix.SOL_SOCKET,
+                           posix.SO_SNDBUF, addr sockBuf, SockLen(sizeof(sockBuf)))
   if deferSec > 0:
     var dv: cint = cint(deferSec)
     discard posix.setsockopt(SocketHandle(result), posix.IPPROTO_TCP,
