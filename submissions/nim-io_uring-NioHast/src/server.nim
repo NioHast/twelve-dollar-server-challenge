@@ -457,8 +457,8 @@ const
   # a longer idle wait. The 8/100 us point keeps the N>1 eventfd/epoll path
   # (which does not use this batch wait at all) unchanged as well.
   BatchMinComplete    = 8'u32
-  BatchMaxUsec        = 100'u64
-  BatchLoadThreshold  = 8
+  BatchMaxUsec        = 250'u64
+  BatchLoadThreshold  = 32
 
   # -------------------------------------------------------------------------
   # Output-buffer pool.
@@ -507,7 +507,7 @@ const
   # Multi-ring default budget: the ring count is at most MaxRings, so splitting
   # one bounded global budget keeps total provided buffers independent of ring
   # count. The single-ring path uses BufRingDefault.
-  MultiBufBudget = 4096
+  MultiBufBudget = 8192
 
 # kernel-side struct for IORING_OP_TIMEOUT
 type KernelTimespec {.bycopy.} = object

@@ -36,6 +36,8 @@ import ./sqlite3
 const
   CkDefaultIntervalMs = 1000
   CkBusyTimeoutMs = 5000
+  CkFrameInterval = 4096
+  CkWALSoftLimit = 65536
 
   ## SQLITE_CHECKPOINT_PASSIVE is 0; FULL is 1. FULL/RESTART wait for readers
   ## and can stall the writer, so only PASSIVE is used while serving.
@@ -71,6 +73,7 @@ type
     efd: cint
     thread: Pthread
     intervalMs: cint
+    lastFrames: Atomic[int64] ## pnLog after the latest checkpoint
     wanted: Atomic[int32]     ## set by the request thread, consumed by worker
     stop: Atomic[int32]
     started: cint             ## pthread_create succeeded (written before start)
@@ -148,6 +151,8 @@ proc ckRunOnce(c: ptr CkCtx) =
   let rc = sqlite3_wal_checkpoint_v2(c.db, nil, SqliteCheckpointPassive,
                                      addr pnLog, addr pnCkpt)
   let dur = ckNowUs() - t0
+  if pnLog >= 0:
+    c.lastFrames.store(int64(pnLog), moRelaxed)
 
   discard c.count.fetchAdd(1'i64, moRelaxed)
   discard c.totalUs.fetchAdd(dur, moRelaxed)
@@ -187,8 +192,17 @@ proc ckRunOnce(c: ptr CkCtx) =
 proc ckWalHook(arg: pointer, db: ptr Sqlite3, zdb: cstring,
                nframe: cint): cint {.cdecl.} =
   ## Runs on the request thread right after a commit releases the write lock.
-  ## It must not call SQLite, so it only raises the flag and wakes the worker.
-  discard ckSignal(arg)
+  ## It must not call SQLite. Signal only when another 4,096 frames have
+  ## accumulated (or the WAL is at the soft limit), so the worker checkpoints
+  ## by write volume rather than by wall-clock time.
+  let c = cast[ptr CkCtx](arg)
+  if c == nil:
+    return SQLITE_OK
+  let frames = int64(nframe)
+  if frames >= 0:
+    let last = c.lastFrames.load(moRelaxed)
+    if frames >= last + CkFrameInterval or frames >= CkWALSoftLimit:
+      discard ckSignal(arg)
   SQLITE_OK
 
 proc ckWorker(arg: pointer): pointer {.noconv, gcsafe.} =
@@ -198,15 +212,10 @@ proc ckWorker(arg: pointer): pointer {.noconv, gcsafe.} =
   pfd.events = POLLIN
   pfd.revents = 0
 
-  var lastRunUs: int64 = 0 # 0: never run -> first wanted checkpoint runs
-
   while c.stop.load(moRelaxed) == 0:
-    var timeout: cint = c.intervalMs
-    if lastRunUs != 0 and c.wanted.load(moRelaxed) != 0:
-      let elapsedMs = (ckNowUs() - lastRunUs) div 1000
-      let left = int64(c.intervalMs) - elapsedMs
-      timeout = cint(if left < 0: 0'i64 else: left)
-
+    # Block until the WAL hook signals a frame threshold. If the flag is
+    # already set, poll once without sleeping and consume it.
+    let timeout: cint = if c.wanted.load(moRelaxed) != 0: 0 else: -1
     let pr = poll(addr pfd, Tnfds(1), timeout)
     if pr < 0:
       if errno == EINTR:
@@ -233,20 +242,9 @@ proc ckWorker(arg: pointer): pointer {.noconv, gcsafe.} =
 
     if c.stop.load(moRelaxed) != 0:
       break
-    if c.wanted.load(moRelaxed) == 0:
-      continue
-
-    # Coalesce: at most one PASSIVE per interval.  A signal that arrived
-    # during the previous checkpoint keeps `wanted` set, so the loop sleeps out
-    # the remainder of the interval instead of checkpointing again immediately.
-    if lastRunUs != 0 and
-        (ckNowUs() - lastRunUs) div 1000 < int64(c.intervalMs):
-      continue
-
     if c.wanted.exchange(0'i32, moRelaxed) == 0:
       continue
     ckRunOnce(c)
-    lastRunUs = ckNowUs()
 
   # Shutdown: run a checkpoint that was still wanted so a stop cannot silently
   # drop the last committed frames.
@@ -285,6 +283,7 @@ proc ckStart*(path: cstring, intervalMs: cint): pointer {.raises: [].} =
   c.count.store(0'i64, moRelaxed)
   c.totalUs.store(0'i64, moRelaxed)
   c.maxUs.store(0'i64, moRelaxed)
+  c.lastFrames.store(0'i64, moRelaxed)
   c.lastPnLog.store(-1'i64, moRelaxed)
   c.lastPnCkpt.store(-1'i64, moRelaxed)
   c.busyCount.store(0'i64, moRelaxed)
@@ -312,7 +311,7 @@ proc ckStart*(path: cstring, intervalMs: cint): pointer {.raises: [].} =
   # PASSIVE truncates/limits the WAL only when this connection performs the
   # checkpoint, so the WAL bound is set here as well as on the request
   # connection.  It is a connection setting, not a write.
-  discard sqlite3_exec(c.db, cstring("PRAGMA journal_size_limit=67108864;"),
+  discard sqlite3_exec(c.db, cstring("PRAGMA journal_size_limit=16777216;"),
                        nil, nil, nil)
 
   # Prime the connection.  A freshly opened connection that has never read the

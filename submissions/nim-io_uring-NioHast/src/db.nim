@@ -199,7 +199,7 @@ proc applyPragmas(db: Db) =
   db.execPragma("busy_timeout=5000", tolerate = false)
   db.execPragma("foreign_keys=ON", tolerate = false)
   db.execPragma("temp_store=MEMORY", tolerate = false)
-  db.execPragma("cache_size=-64", tolerate = false)
+  db.execPragma("cache_size=-2048", tolerate = false)
   # mmap size is env-tunable (SQLITE_MMAP_SIZE, bytes; default 1 GiB).
   var mmapBytes = 1073741824
   try:
@@ -208,14 +208,12 @@ proc applyPragmas(db: Db) =
     mmapBytes = 1073741824
   db.execPragma("mmap_size=" & $mmapBytes, tolerate = false)
   # WAL autocheckpoint is DISABLED (0): the dedicated checkpoint connection
-  # runs PASSIVE checkpoints on its own thread (coalesced to ~1/s). This keeps
-  # the WAL copy and fsync off the request thread. journal_size_limit still
-  # bounds the file at a natural quiet point; while the writer is continuously
-  # active a PASSIVE checkpoint can trail the write head, so the WAL may grow
-  # during a saturated run (measured ~120-225 MiB at 64k). That disk cost is
-  # preferred over a multi-second request-thread stall.
+  # runs PASSIVE checkpoints on its own thread, triggered after 4,096 new WAL
+  # frames rather than on a fixed timer. This keeps the WAL small and moves the
+  # copy/fsync off the request thread. journal_size_limit bounds the file at a
+  # natural quiet point (16 MiB, matching the Rust submission).
   db.execPragma("wal_autocheckpoint=0", tolerate = false)
-  db.execPragma("journal_size_limit=67108864", tolerate = false)
+  db.execPragma("journal_size_limit=16777216", tolerate = false)
 
 proc prepare(db: Db, sql: string): ptr Sqlite3Stmt =
   var stmt: ptr Sqlite3Stmt
@@ -400,7 +398,7 @@ proc startCheckpointer*(db: Db) =
   ## checkpointed would grow it without bound.
   if db.ckCtx != nil:
     return
-  db.ckCtx = ckStart(db.path.cstring, 1000)
+  db.ckCtx = ckStart(db.path.cstring, 0)
   if db.ckCtx == nil:
     raise newException(DbError, "checkpoint thread failed to start")
   ckInstallHook(cast[pointer](db.handle), db.ckCtx)
