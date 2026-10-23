@@ -398,7 +398,7 @@ proc startCheckpointer*(db: Db) =
   ## checkpointed would grow it without bound.
   if db.ckCtx != nil:
     return
-  db.ckCtx = ckStart(db.path.cstring, 0)
+  db.ckCtx = ckStart(db.path.cstring, 250)
   if db.ckCtx == nil:
     raise newException(DbError, "checkpoint thread failed to start")
   ckInstallHook(cast[pointer](db.handle), db.ckCtx)
